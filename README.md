@@ -10,7 +10,7 @@ Poster dưới đây tóm tắt toàn bộ hệ thống AgroMesh Smart Irrigatio
 - Luồng dữ liệu
 - Kết quả đạt được
 
-![AgroMesh Poster](docs/system-poster.png)
+![AgroMesh Poster](docs/Poster_Nhom5.png)
 
 ---
 
