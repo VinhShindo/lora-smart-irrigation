@@ -34,7 +34,9 @@ Sơ đồ dưới đây mô tả kiến trúc tổng thể của hệ thống Ag
 - Luồng dữ liệu **uplink** (MQTT – màu mũi tên riêng)
 - Luồng điều khiển **downlink** (HTTP/MQTT)
 - Vai trò trung gian của Redis trong việc đồng bộ trạng thái
+
 ![System Architecture Diagram](docs/system-diagram.png)
+
 Hệ thống gồm 4 lớp chính:
 
 ### 2.1. Node (Thiết bị ngoài đồng)
