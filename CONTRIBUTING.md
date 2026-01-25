@@ -41,3 +41,29 @@ Nhóm gồm 3 người:
 ## 4. Quy trình làm việc
 
 1. Tạo branch mới:
+```git checkout -b feature/ten-chuc-nang```
+2. Code và test cẩn thận.
+3. Commit:
+```git commit -m "Add: mo ta chuc nang"```
+4. Push và tạo Pull Request.
+5. Trưởng nhóm review và merge.
+
+---
+
+## 5. Nguyên tắc code
+
+- Code rõ ràng, dễ đọc.
+- Không hard-code logic phức tạp.
+- Ưu tiên ổn định hơn tối ưu sớm.
+- Luôn giữ đúng luồng uplink / downlink đã thiết kế.
+
+---
+
+## 6. Trao đổi & thống nhất
+
+- Mọi thay đổi lớn về kiến trúc phải được thống nhất trước.
+- Không tự ý thay đổi giao thức hoặc format dữ liệu.
+
+---
+
+Cảm ơn bạn đã đóng góp cho dự án!
