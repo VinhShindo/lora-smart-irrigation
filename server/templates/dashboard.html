@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Smart Garden Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <style>
+        body {
+            font-family: Arial;
+            background: #0f172a;
+            color: #e5e7eb;
+            padding: 20px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 20px;
+        }
+
+        .card {
+            background: #1e293b;
+            padding: 15px;
+            border-radius: 12px;
+            transition: opacity 0.3s;
+        }
+
+        .status {
+            margin: 4px 0;
+        }
+
+        button {
+            padding: 6px 14px;
+            border-radius: 6px;
+            border: none;
+            margin-right: 5px;
+            cursor: pointer;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .on {
+            background: #22c55e;
+        }
+
+        .off {
+            background: #ef4444;
+        }
+
+        .sensor {
+            margin-top: 10px;
+            font-size: 14px;
+        }
+
+        canvas {
+            margin-top: 6px;
+        }
+
+        .pending-wait {
+            color: #facc15;
+            font-weight: bold;
+        }
+
+        .pending-done {
+            color: #22c55e;
+        }
+
+        .node-online {
+            color: #22c55e;
+            font-weight: bold;
+        }
+
+        .node-offline {
+            color: #ef4444;
+            font-weight: bold;
+        }
+
+        .pending-ready {
+            color: #38bdf8;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h2>🌱 Smart Garden – 3 Nodes</h2>
+
+    <div class="grid">
+        {% for node in nodes %}
+        <div class="card" id="{{node}}">
+            <h3>{{node}}</h3>
+
+            <!-- NODE STATUS -->
+            <div class="status">
+                🧠 Node: <span class="node-status">--</span>
+            </div>
+
+            <!-- COMMAND STATUS -->
+            <div class="status">
+                ⏳ Command: <span class="pending pending-ready">READY</span>
+            </div>
+
+            <!-- DEVICE STATUS -->
+            <div class="status">📡 RSSI: <span class="rssi">--</span> dBm</div>
+            <div class="status">⚙ Pump: <span class="pump">--</span></div>
+            <div class="status">🔁 Mode: <span class="mode">--</span></div>
+            <div class="status">🔌 Current: <span class="amp">--</span> A</div>
+            <div class="status">💧 Flow: <span class="flow">--</span> L/min</div>
+            <div class="status">🌱 Soil at trigger: <span class="soil">--</span> %</div>
+            <div class="status">🕒 Updated: <span class="time">--</span></div>
+            <div class="status">⏱ Runtime: <span class="runtime">--</span> min</div>
+            <div class="status">🎯 Trigger: <span class="trigger">--</span></div>
+            <div class="status">🔄 Prev: <span class="prev-status">--</span></div>
+
+            <button class="on" onclick="control('{{node}}','ON')">BẬT</button>
+            <button class="off" onclick="control('{{node}}','OFF')">TẮT</button>
+
+            <hr>
+
+            <!-- SENSOR LATEST -->
+            <div class="sensor">🌡 Temp: <b><span class="temp">--</span> °C</b></div>
+            <div class="sensor">💧 Humi: <b><span class="humi">--</span> %</b></div>
+            <div class="sensor">🌱 Soil: <b><span class="soil_m">--</span> %</b></div>
+            <div class="sensor">☀ Light: <b><span class="light">--</span></b></div>
+
+            <canvas id="chart-temp-{{node}}" height="120"></canvas>
+            <canvas id="chart-humi-{{node}}" height="120"></canvas>
+            <canvas id="chart-soil-{{node}}" height="120"></canvas>
+            <canvas id="chart-light-{{node}}" height="120"></canvas>
+
+        </div>
+        {% endfor %}
+    </div>
+
+    <script>
+        const charts = {};
+        const pendingWatchdog = {};
+        const COMMAND_TIMEOUT = 5000; // 5 giây
+
+        function control(node, action) {
+            const card = document.getElementById(node);
+            const pending = card.querySelector(".pending");
+
+            pending.innerText = "PENDING...";
+            pending.className = "pending pending-wait";
+
+            fetch("/control", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ node_id: node, action })
+            }).then(() => {
+
+                // Clear watchdog cũ nếu có
+                if (pendingWatchdog[node]) {
+                    clearTimeout(pendingWatchdog[node]);
+                }
+
+                // Start watchdog mới
+                pendingWatchdog[node] = setTimeout(() => {
+                    const card = document.getElementById(node);
+                    const p = card.querySelector(".pending");
+
+                    p.innerText = "TIMEOUT";
+                    p.className = "pending pending-ready";
+
+                    console.warn(`[WATCHDOG] Command timeout for ${node}`);
+                }, COMMAND_TIMEOUT);
+
+            });
+        }
+
+        function loadPending(node) {
+            fetch(`/api/node/${node}/pending`)
+                .then(r => r.json())
+                .then(d => {
+                    const el = document.getElementById(node);
+                    const p = el.querySelector(".pending");
+
+                    if (d.pending) {
+                        p.innerText = "EXECUTING...";
+                        p.className = "pending pending-wait";
+                    } else {
+                        // ACK received → clear watchdog
+                        if (pendingWatchdog[node]) {
+                            clearTimeout(pendingWatchdog[node]);
+                            delete pendingWatchdog[node];
+                        }
+
+                        p.innerText = "READY";
+                        p.className = "pending pending-ready";
+                    }
+                });
+        }
+
+        function loadStatus(node) {
+            fetch(`/api/node/${node}/status`)
+                .then(r => r.json())
+                .then(d => {
+                    const el = document.getElementById(node);
+                    const nodeStatus = el.querySelector(".node-status");
+                    const buttons = el.querySelectorAll("button");
+
+                    if (d.current_status === "OFFLINE") {
+                        nodeStatus.innerText = "OFFLINE";
+                        nodeStatus.className = "node-status node-offline";
+                        el.style.opacity = 0.5;
+                        buttons.forEach(b => b.disabled = true);
+                        return;
+                    }
+
+                    if (d.current_status === "ERROR") {
+                        nodeStatus.innerText = "ERROR";
+                        nodeStatus.style.color = "#f97316";
+                    } else {
+                        nodeStatus.innerText = "ONLINE";
+                        nodeStatus.className = "node-status node-online";
+                    }
+
+
+                    nodeStatus.innerText = "ONLINE";
+                    nodeStatus.className = "node-status node-online";
+                    el.style.opacity = 1;
+                    buttons.forEach(b => b.disabled = false);
+
+                    const rssiEl = el.querySelector(".rssi");
+                    rssiEl.innerText = d.rssi ?? "--";
+
+                    if (d.rssi !== undefined && d.rssi < -110) {
+                        rssiEl.style.color = "#ef4444"; // đỏ
+                    } else {
+                        rssiEl.style.color = "";
+                    }
+                    el.querySelector(".pump").innerText = d.pump ?? "--";
+                    el.querySelector(".mode").innerText = d.mode ?? "--";
+                    el.querySelector(".amp").innerText = d.amp ?? "--";
+                    el.querySelector(".flow").innerText = d.flow ?? "--";
+                    el.querySelector(".soil").innerText = d.last_soil ?? "--";
+                    el.querySelector(".time").innerText =
+                        new Date(d.updated_at).toLocaleTimeString();
+                    el.querySelector(".runtime").innerText = d.duration_minutes ?? "--";
+                    el.querySelector(".trigger").innerText = d.trigger_source ?? "--";
+                    el.querySelector(".prev-status").innerText = d.previous_status ?? "--";
+                });
+        }
+
+        function makeChart(id, label, data) {
+            if (!charts[id]) {
+                charts[id] = new Chart(document.getElementById(id), {
+                    type: 'line',
+                    data: {
+                        labels: [],
+                        datasets: [{
+                            label: label,
+                            data: [],
+                            borderColor: '#22c55e'
+                        }]
+                    },
+                    options: { animation: false }
+                });
+            }
+            charts[id].data.labels = data.labels;
+            charts[id].data.datasets[0].data = data.values;
+            charts[id].update();
+        }
+
+        function loadMeasurements(node) {
+            fetch(`/api/node/${node}/measurements`)
+                .then(r => r.json())
+                .then(data => {
+                    if (!data.length) return;
+
+                    data.reverse();
+                    const el = document.getElementById(node);
+                    const last = data[data.length - 1];
+
+                    el.querySelector(".temp").innerText = last.temp;
+                    el.querySelector(".humi").innerText = last.humi;
+                    el.querySelector(".soil_m").innerText = last.soil;
+                    el.querySelector(".light").innerText = last.light;
+
+                    const labels = data.map(x => x.created_at.slice(11, 19));
+
+                    makeChart(`chart-temp-${node}`, "Temp (°C)", {
+                        labels, values: data.map(x => x.temp)
+                    });
+                    makeChart(`chart-humi-${node}`, "Humi (%)", {
+                        labels, values: data.map(x => x.humi)
+                    });
+                    makeChart(`chart-soil-${node}`, "Soil (%)", {
+                        labels, values: data.map(x => x.soil)
+                    });
+                    makeChart(`chart-light-${node}`, "Light", {
+                        labels, values: data.map(x => x.light)
+                    });
+                });
+        }
+
+        function refresh() {
+            {% for node in nodes %}
+            loadStatus("{{node}}");
+            loadMeasurements("{{node}}");
+            loadPending("{{node}}");
+            {% endfor %}
+        }
+
+        setInterval(refresh, 2000);
+        refresh();
+    </script>
+
+</body>
+
+</html>
