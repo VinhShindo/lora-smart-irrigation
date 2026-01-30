@@ -140,42 +140,39 @@
 
     <script>
         const charts = {};
+        const uiLock = {};
         const pendingWatchdog = {};
-        const COMMAND_TIMEOUT = 5000; // 5 giây
+        const COMMAND_TIMEOUT = 5000;
+
+        /* ================= CONTROL ================= */
 
         function control(node, action) {
-            const card = document.getElementById(node);
-            const pending = card.querySelector(".pending");
+            const el = document.getElementById(node);
+            const p = el.querySelector(".pending");
 
-            pending.innerText = "PENDING...";
-            pending.className = "pending pending-wait";
+            p.innerText = "PENDING...";
+            p.className = "pending pending-wait";
 
             fetch("/control", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ node_id: node, action })
             }).then(() => {
-
-                // Clear watchdog cũ nếu có
-                if (pendingWatchdog[node]) {
-                    clearTimeout(pendingWatchdog[node]);
-                }
-
-                // Start watchdog mới
-                pendingWatchdog[node] = setTimeout(() => {
-                    const card = document.getElementById(node);
-                    const p = card.querySelector(".pending");
-
-                    p.innerText = "TIMEOUT";
-                    p.className = "pending pending-ready";
-
-                    console.warn(`[WATCHDOG] Command timeout for ${node}`);
-                }, COMMAND_TIMEOUT);
-
+                watchPending(node); // 🔥 BẮT ĐẦU THEO DÕI ACK NGAY
             });
+
+            // watchdog
+            if (pendingWatchdog[node]) clearTimeout(pendingWatchdog[node]);
+            pendingWatchdog[node] = setTimeout(() => {
+                p.innerText = "TIMEOUT";
+                p.className = "pending pending-ready";
+                console.warn(`[WATCHDOG] ${node} timeout`);
+            }, COMMAND_TIMEOUT);
         }
 
-        function loadPending(node) {
+        /* ================= PENDING WATCHER ================= */
+
+        function watchPending(node) {
             fetch(`/api/node/${node}/pending`)
                 .then(r => r.json())
                 .then(d => {
@@ -185,18 +182,42 @@
                     if (d.pending) {
                         p.innerText = "EXECUTING...";
                         p.className = "pending pending-wait";
+
+                        setTimeout(() => watchPending(node), 120);
                     } else {
-                        // ACK received → clear watchdog
-                        if (pendingWatchdog[node]) {
-                            clearTimeout(pendingWatchdog[node]);
-                            delete pendingWatchdog[node];
-                        }
+                        clearTimeout(pendingWatchdog[node]);
 
                         p.innerText = "READY";
                         p.className = "pending pending-ready";
+
+                        loadFeedback(node); // 🔥 ACK XONG → UPDATE NGAY
                     }
+                })
+                .catch(() => {
+                    setTimeout(() => watchPending(node), 300);
                 });
         }
+
+        /* ================= REALTIME FEEDBACK ================= */
+
+        function loadFeedback(node) {
+            fetch(`/api/node/${node}/feedback`)
+                .then(r => r.json())
+                .then(d => {
+                    if (!d.ok) return;
+
+                    const el = document.getElementById(node);
+
+                    uiLock[node] = Date.now(); // 🔒 KHÓA UI TẠM
+
+                    el.querySelector(".pump").innerText = d.pump ?? "--";
+                    el.querySelector(".mode").innerText = d.mode ?? "--";
+                    el.querySelector(".time").innerText =
+                        d.updated_at ? new Date(d.updated_at).toLocaleTimeString() : "--";
+                });
+        }
+
+        /* ================= STATUS (BACKUP ONLY) ================= */
 
         function loadStatus(node) {
             fetch(`/api/node/${node}/status`)
@@ -214,40 +235,39 @@
                         return;
                     }
 
-                    if (d.current_status === "ERROR") {
-                        nodeStatus.innerText = "ERROR";
-                        nodeStatus.style.color = "#f97316";
-                    } else {
-                        nodeStatus.innerText = "ONLINE";
-                        nodeStatus.className = "node-status node-online";
-                    }
-
-
                     nodeStatus.innerText = "ONLINE";
                     nodeStatus.className = "node-status node-online";
                     el.style.opacity = 1;
                     buttons.forEach(b => b.disabled = false);
 
-                    const rssiEl = el.querySelector(".rssi");
-                    rssiEl.innerText = d.rssi ?? "--";
+                    el.querySelector(".rssi").innerText = d.rssi ?? "--";
 
-                    if (d.rssi !== undefined && d.rssi < -110) {
-                        rssiEl.style.color = "#ef4444"; // đỏ
-                    } else {
-                        rssiEl.style.color = "";
+                    // ⛔ nếu vừa có feedback thì KHÔNG ghi đè
+                    if (uiLock[node] && Date.now() - uiLock[node] < 2000) {
+                        return;
                     }
+
                     el.querySelector(".pump").innerText = d.pump ?? "--";
                     el.querySelector(".mode").innerText = d.mode ?? "--";
                     el.querySelector(".amp").innerText = d.amp ?? "--";
                     el.querySelector(".flow").innerText = d.flow ?? "--";
                     el.querySelector(".soil").innerText = d.last_soil ?? "--";
                     el.querySelector(".time").innerText =
-                        new Date(d.updated_at).toLocaleTimeString();
+                        d.updated_at ? new Date(d.updated_at).toLocaleTimeString() : "--";
                     el.querySelector(".runtime").innerText = d.duration_minutes ?? "--";
-                    el.querySelector(".trigger").innerText = d.trigger_source ?? "--";
                     el.querySelector(".prev-status").innerText = d.previous_status ?? "--";
+
+                    let trigger = d.trigger_source;
+                    if (!trigger) {
+                        if (d.mode === "SEN") trigger = "SENSOR";
+                        else if (d.mode === "CLD") trigger = "CLOUD";
+                        else trigger = "READY";
+                    }
+                    el.querySelector(".trigger").innerText = trigger;
                 });
         }
+
+        /* ================= MEASUREMENTS ================= */
 
         function makeChart(id, label, data) {
             if (!charts[id]) {
@@ -301,15 +321,16 @@
                 });
         }
 
+        /* ================= PERIODIC REFRESH (BACKUP) ================= */
+
         function refresh() {
             {% for node in nodes %}
             loadStatus("{{node}}");
             loadMeasurements("{{node}}");
-            loadPending("{{node}}");
             {% endfor %}
         }
 
-        setInterval(refresh, 2000);
+        setInterval(refresh, 5000);
         refresh();
     </script>
 

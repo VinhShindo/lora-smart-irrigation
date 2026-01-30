@@ -9,8 +9,7 @@ MQTT_BROKER = "localhost"
 MQTT_PORT = 1883
 MQTT_TOPICS = [
     ("garden/status", 1),
-    ("factory/control/+/ack", 1),
-    ("factory/control/+/stat", 1)
+    ("garden/control/ack", 1)
 ]
 
 GATEWAY_WHITELIST = {"ESP32_GATEWAY_01"}
@@ -18,163 +17,183 @@ NODE_WHITELIST = {"NODE_01", "NODE_02", "NODE_03"}
 
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
-
-HTTP_PORT = 5000   # HTTP ingest riêng
+HTTP_PORT = 5000
 # =========================================
 
 app = Flask(__name__)
 rds = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
-# ---------- MQTT HANDLER ----------
+# ---------- HELPERS ----------
 
-def handle_operating_status(payload_json):
-    # data = json.loads(payload_json)
-    data = payload_json
-    node_id = data["node_id"]
-    now = datetime.now().isoformat()
+def safe_float(val):
+    try:
+        return float(val)
+    except Exception:
+        return None
 
-    # ==============================
-    # 1️⃣ Realtime cache cho Flask
-    # ==============================
-    rds.set(
-        f"node:status:{node_id}",
-        json.dumps({
-            "rssi": data.get("rssi"),
+def safe_int(val):
+    try:
+        return int(val)
+    except Exception:
+        return None
+
+def now_iso():
+    return datetime.now().isoformat()
+
+# ---------- MQTT HANDLERS ----------
+
+def handle_operating_status(data: dict):
+    try:
+        node_id = data.get("node_id")
+        if node_id not in NODE_WHITELIST:
+            print(f"[SECURITY] Reject status from {node_id}")
+            return
+
+        payload = {
+            "rssi": safe_int(data.get("rssi")),
             "pump": data.get("pump"),
             "mode": data.get("mode"),
-            "amp": data.get("amp"),
-            "flow": data.get("flow"),
-            "last_soil": data.get("last_soil"),
+            "amp": safe_float(data.get("amp")),
+            "flow": safe_float(data.get("flow")),
+            "last_soil": safe_float(data.get("last_soil")),
             "current_status": data.get("current_status"),
-            "updated_at": now
-        }),
-        ex=15
-    )
+            "updated_at": now_iso()
+        }
 
-    # ==============================
-    # 2️⃣ DB queues (tách riêng)
-    # ==============================
-    rds.lpush("queue:db:node_status", json.dumps({
-        "node_id": node_id,
-        "rssi": data.get("rssi"),
-        "current_status": data.get("current_status"),
-        "updated_at": now
-    }))
+        # Realtime cache
+        rds.set(f"node:status:{node_id}", json.dumps(payload), ex=15)
 
-    rds.lpush("queue:db:device_status", json.dumps({
-        "component_id": f"{node_id}_PUMP_01",
-        "node_id": node_id,
-        "component_type": "PUMP",
-        "current_status": data.get("pump"),
-        "trigger_source": data.get("mode"),
-        "current_consumption": data.get("amp"),
-        "flow_rate": data.get("flow"),
-        "last_value": data.get("last_soil"),
-        "updated_at": now
-    }))
+        # DB queues
+        rds.lpush("queue:db:node_status", json.dumps({
+            "node_id": node_id,
+            "rssi": payload["rssi"],
+            "current_status": payload["current_status"],
+            "updated_at": payload["updated_at"]
+        }))
 
-    print(f"[REDIS] Updated realtime & queued status {node_id}")
+        rds.lpush("queue:db:device_status", json.dumps({
+            "component_id": f"{node_id}_PUMP_01",
+            "node_id": node_id,
+            "component_type": "PUMP",
+            "current_status": payload["pump"],
+            "trigger_source": payload["mode"],
+            "current_consumption": payload["amp"],
+            "flow_rate": payload["flow"],
+            "last_value": payload["last_soil"],
+            "updated_at": payload["updated_at"]
+        }))
+
+        print(f"[MQTT][STATUS] {node_id} pump={payload['pump']} mode={payload['mode']}")
+
+    except Exception as e:
+        print(f"[ERROR][STATUS] {e} data={data}")
 
 
-def handle_command_feedback(payload_json):
-    # data = json.loads(payload_json)
-    data = payload_json
-    cmd_id = data["cmd_id"]
+def handle_command_ack(data: dict):
+    try:
+        node_id = data.get("node_id")
+        cmd_id  = data.get("cmd_id")
 
-    # update pending → confirmed
-    rds.set(
-        f"cmd:feedback:{cmd_id}",
-        json.dumps(data),
-        ex=30
-    )
+        if node_id not in NODE_WHITELIST or not cmd_id:
+            print("[ACK] Invalid ACK payload")
+            return
 
-    rds.delete(f"cmd:pending:{cmd_id}")
+        rds.delete(f"cmd:pending:{cmd_id}")
+        rds.delete(f"node:pending:{node_id}")
+        
+        # rds.set(f"cmd:feedback:{cmd_id}", json.dumps(data), ex=30)
 
-    print(f"[CMD-ACK] {cmd_id} → {data['result']}")
+        # Fast UI update
+        status_raw = rds.get(f"node:status:{node_id}")
+        status = json.loads(status_raw) if status_raw else {}
 
+        status.update({
+            "pump": data.get("pump"),
+            "mode": data.get("mode"),
+            "last_soil": safe_float(data.get("last_soil")),
+            "updated_at": now_iso()
+        })
+
+        rds.set(f"node:status:{node_id}", json.dumps(status), ex=15)
+
+        print(f"[MQTT][ACK] cmd={cmd_id} node={node_id} pump={data.get('pump')}")
+
+    except Exception as e:
+        print(f"[ERROR][ACK] {e} data={data}")
+
+# ---------- MQTT CALLBACKS ----------
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         client.subscribe(MQTT_TOPICS)
         print("[MQTT] Connected & subscribed")
 
-# def on_message(client, userdata, msg):
-#     payload = msg.payload.decode()
-#     if msg.topic == "garden/status":
-#         handle_operating_status(payload)
-#     elif "stat" in msg.topic:
-#         handle_command_feedback(payload)
 
 def on_message(client, userdata, msg):
-    data = json.loads(msg.payload.decode())
-    now = datetime.now().isoformat()
-    node_id = data.get("node_id")
-
-    if node_id not in NODE_WHITELIST:
-        print(f"[SECURITY] Reject MQTT from unknown node: {node_id}")
+    try:
+        data = json.loads(msg.payload.decode())
+    except Exception:
+        print("[MQTT][DROP] Invalid JSON")
         return
-    
-    if msg.topic.endswith("/ack"):
-        node_id = data["node_id"]
-        cmd_id  = data["cmd_id"]
 
-        rds.delete(f"cmd:pending:{cmd_id}")
-        rds.delete(f"node:pending:{node_id}")
-
-        current_status_raw = rds.get(f"node:status:{node_id}")
-        if current_status_raw:
-            status_data = json.loads(current_status_raw)
-        else:
-            status_data = {}
-
-        status_data.update({
-            "pump": data["pump"],
-            "mode": data["mode"],
-            "updated_at": now
-        })
-
-        rds.set(f"node:status:{node_id}", json.dumps(status_data), ex=15)
-        handle_command_feedback(data)
-        print(f"🚀 [UI FAST-TRACK] Forced update {node_id} pump to {data['pump']}")
-
-    elif msg.topic == "garden/status":
-        node_id = data["node_id"]
-        rds.set(
-            f"node:status:{node_id}",
-            json.dumps(data),
-            ex=15
-        )
+    if msg.topic == "garden/status":
         handle_operating_status(data)
+
+    elif msg.topic == "garden/control/ack":
+        handle_command_ack(data)
 
 # ---------- HTTP INGEST (BATCH) ----------
 
 @app.route("/api/batch", methods=["POST"])
 def ingest_batch():
-    data = request.json
+    try:
+        data = request.json or {}
+        gateway_id = data.get("gateway_id")
+        batch_id   = data.get("batch_id")
 
-    gateway_id = data.get("gateway_id")
+        if gateway_id not in GATEWAY_WHITELIST:
+            return jsonify({"error": "Invalid gateway"}), 403
 
-    if gateway_id not in GATEWAY_WHITELIST:
-        return jsonify({"error": "Invalid gateway"}), 403
+        if not batch_id:
+            return jsonify({"error": "Missing batch_id"}), 400
 
-    measurements = data.get("measurements", [])
+        batch_key = f"batch:{gateway_id}:{batch_id}"
+        if rds.exists(batch_key):
+            print(f"[HTTP][DUPLICATE] batch_id={batch_id}")
+            return jsonify({"status": "duplicate"}), 409
 
-    for m in measurements:
-        if m["node_id"] not in NODE_WHITELIST:
-            print(f"[SECURITY] Drop measurement from {m['node_id']}")
-            continue
+        rds.set(batch_key, now_iso(), ex=3600)
 
-        rds.lpush("queue:measurements", json.dumps({
-            "node_id": m["node_id"],
-            "temp": m["temp"],
-            "humi": m["humi"],
-            "soil": m["soil"],
-            "light": m["light"],
-            "created_at": m.get("timestamp") or datetime.now().isoformat()
-        }))
+        measurements = data.get("measurements", [])
+        accepted = 0
 
-    print(f"[QUEUE] {len(measurements)} measurements queued")
-    return jsonify({"status": "ok", "count": len(measurements)})
+        for m in measurements:
+            try:
+                node_id = m.get("node_id")
+                if node_id not in NODE_WHITELIST:
+                    continue
+
+                record = {
+                    "node_id": node_id,
+                    "temp": safe_float(m.get("temp")),
+                    "humi": safe_float(m.get("humi")),
+                    "soil": safe_float(m.get("soil")),
+                    "light": safe_float(m.get("light")),
+                    "created_at": m.get("timestamp") or now_iso()
+                }
+
+                rds.lpush("queue:measurements", json.dumps(record))
+                accepted += 1
+
+            except Exception as e:
+                print(f"[HTTP][MEAS DROP] {e} data={m}")
+
+        print(f"[HTTP][BATCH OK] gateway={gateway_id} batch={batch_id} records={accepted}")
+        return jsonify({"status": "ok", "count": accepted})
+
+    except Exception as e:
+        print(f"[HTTP][ERROR] {e}")
+        return jsonify({"error": "server error"}), 500
 
 # ---------- START ----------
 
@@ -186,6 +205,7 @@ def start():
     mqtt_client.loop_start()
 
     app.run(host="0.0.0.0", port=HTTP_PORT)
+
 
 if __name__ == "__main__":
     start()
