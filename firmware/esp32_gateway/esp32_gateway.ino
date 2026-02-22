@@ -15,8 +15,8 @@
 
 const char* WIFI_SSID = "Shindo";
 const char* WIFI_PASS = "vinh1230987";
-const char* MQTT_SRV  = "192.168.0.101";
-const char* API_URL   = "http://192.168.0.101:5000/api/batch";
+const char* MQTT_SRV  = "192.168.0.105";
+const char* API_URL   = "http://192.168.0.105:5000/api/batch";
 
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
@@ -26,7 +26,7 @@ unsigned long lastLoRaRetry = 0;
 
 #define MAX_BUF 50
 String buffer[MAX_BUF];
-int head = 0, count = 0;
+int head = 0, count = 0;  
 SemaphoreHandle_t mutex;
 
 struct NodeState {
@@ -122,7 +122,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
     return;
   }
 
-  if (xQueueSend(cmdQueue, &item, 0) != pdPASS) {
+  if (xQueueSend(cmdQueue, &item, pdMS_TO_TICKS(50)) != pdPASS) {
     lastHeartbeatSent = millis();
     Serial.println("[CMD QUEUE] FULL - drop CMD");
   } else {
@@ -170,7 +170,7 @@ void core0Task(void* p) {
     /* ======================================================
      * P0 – LoRa RX (ƯU TIÊN CAO NHẤT)
      * ====================================================== */
-    if (loraReady && xSemaphoreTake(loraMutex, 0)) {
+    if (loraReady && xSemaphoreTake(loraMutex, pdMS_TO_TICKS(10))) {
 
       int packetSize = LoRa.parsePacket();
       if (packetSize) {
@@ -202,6 +202,7 @@ void core0Task(void* p) {
           v[idx] = raw.substring(start);
 
           StaticJsonDocument<256> ack;
+          ack["type"]      = "ACK";
           ack["node_id"]   = v[1];
           ack["cmd_id"]    = v[2];
           ack["pump"]      = v[3];
@@ -250,6 +251,7 @@ void core0Task(void* p) {
         }
 
         StaticJsonDocument<512> status;
+        status["type"] = "STATUS";
         status["node_id"] = node;
         status["pump"] = (v[5] == "1") ? "ON" : "OFF";
         status["mode"] = v[6];
@@ -261,7 +263,7 @@ void core0Task(void* p) {
 
         String msg;
         serializeJson(status, msg);
-        bool ok = mqtt.publish("garden/status", msg.c_str());
+        bool ok = mqtt.publish("garden/status", msg.c_str(), false);
         Serial.println(ok ? "[MQTT][TX STATUS] " + msg
                           : "[MQTT][TX STATUS] FAIL");
 
@@ -375,13 +377,14 @@ void core1Task(void* p) {
         it.second.online = false;
 
         StaticJsonDocument<256> off;
+        off["type"] = "STATUS"; 
         off["node_id"] = it.first;
         off["current_status"] = "OFFLINE";
         off["rssi"] = it.second.rssi;
 
         String msg;
         serializeJson(off, msg);
-        mqtt.publish("garden/status", msg.c_str());
+        mqtt.publish("garden/status", msg.c_str(), false);
 
         Serial.println("[NODE OFFLINE] " + it.first);
       }
@@ -415,7 +418,7 @@ void setup() {
     esp_restart();
   }
 
-  xTaskCreatePinnedToCore(cmdTask, "CMD", 4096, NULL, 5, NULL, 0);
+  xTaskCreatePinnedToCore(cmdTask, "CMD", 4096, NULL, 6, NULL, 0);
   xTaskCreatePinnedToCore(core0Task, "CORE0", 8192, NULL, 3, NULL, 0);
   xTaskCreatePinnedToCore(core1Task, "CORE1", 8192, NULL, 1, NULL, 1);
 }
