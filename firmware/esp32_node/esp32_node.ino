@@ -16,7 +16,6 @@ const String SECRET_KEY = "12345";
 const unsigned long SEND_INTERVAL = 5000;
 const int LORA_RETRY_MAX = 5;
 
-/* ===== HEARTBEAT CONFIG (NEW) ===== */
 const unsigned long HEARTBEAT_TIMEOUT = 60000;
 unsigned long lastGatewaySeen = 0;
 
@@ -37,6 +36,12 @@ bool loraReady = false;
 
 int cachedSoil = 0;
 unsigned long bootTime = 0;
+
+/* ===== ADDED: COMMAND PRIORITY LOCK ===== */
+bool cmdProcessing = false;
+unsigned long cmdLockUntil = 0;
+const unsigned long CMD_LOCK_TIME = 2000;
+/* ========================================= */
 
 void initLoRa() {
   LoRa.setPins(PIN_LORA_SS, PIN_LORA_RST, PIN_LORA_DIO0);
@@ -92,11 +97,18 @@ void setup() {
   pinMode(PIN_RELAY, OUTPUT);
   digitalWrite(PIN_RELAY, LOW);
   Serial.println("[BOOT] Relay: TẮT | Chế độ: READY");
-  unsigned long bootTime = 0;
+  bootTime = millis();
   initLoRa();
 }
 
 void loop() {
+
+  /* ===== ADDED: GLOBAL CMD LOCK CHECK ===== */
+  if (cmdProcessing && millis() < cmdLockUntil) {
+    return;
+  }
+  cmdProcessing = false;
+  /* ======================================== */
 
   if (loraReady) {
     int packetSize = LoRa.parsePacket();
@@ -106,14 +118,13 @@ void loop() {
 
       Serial.println("[LORA][RX] Nhận lệnh: " + msg);
 
-      /* ===== HEARTBEAT RX (NEW) ===== */
       if (msg.startsWith("HB")) {
         lastGatewaySeen = millis();
         Serial.println("[HB] RX");
       }
 
       if (msg.startsWith("CMD")) {
-        lastGatewaySeen = millis();  // CMD cũng là heartbeat hợp lệ
+        lastGatewaySeen = millis();
 
         int soil_now = readSoil();
 
@@ -127,30 +138,33 @@ void loop() {
         action.trim();
 
         if (target == NODE_ID) {
-          Serial.println("[CMD] Chấp nhận lệnh ID: " + cmd_id);
-          
+
           if (action == "ON") {
             mode = "CLD";
             pumpStatus = true;
-            Serial.println("[CMD] Đang thực hiện BẬT máy bơm...");
           } else if (action == "OFF") {
             mode = "CLD";
             pumpStatus = false;
-            Serial.println("[CMD] Đang thực hiện TẮT máy bơm...");
           } else if (action == "AUTO") {
             mode = "SEN";
-            Serial.println("[CMD] Chuyển sang chế độ TỰ ĐỘNG (SEN)");
           }
 
           last_trigger_soil = soil_now;
 
+          digitalWrite(PIN_RELAY, pumpStatus);
+
           String ack = "ACK," + NODE_ID + "," + cmd_id + "," +
                        (pumpStatus ? "ON" : "OFF") + "," +
                        mode + "," + String(last_trigger_soil, 1);
+
           sendUplink(ack);
           lastSend = millis();
-        } else {
-          Serial.println("[CMD] Bỏ qua, không phải địa chỉ của Node này");
+
+          /* ===== ADDED: ACTIVATE LOCK AFTER CMD ===== */
+          cmdProcessing = true;
+          cmdLockUntil = millis() + CMD_LOCK_TIME;
+          /* ========================================== */
+
         }
       }
     }
@@ -169,17 +183,14 @@ void loop() {
     if (cachedSoil < 30 && !pumpStatus) {
       pumpStatus = true;
       last_trigger_soil = cachedSoil;
-      Serial.printf("[AUTO] Độ ẩm thấp (%d%%) -> BẬT BƠM\n", cachedSoil);
     } else if (cachedSoil > 70 && pumpStatus) {
       pumpStatus = false;
       last_trigger_soil = cachedSoil;
-      Serial.printf("[AUTO] Độ ẩm đủ (%d%%) -> TẮT BƠM\n", cachedSoil);
     }
   }
 
   digitalWrite(PIN_RELAY, pumpStatus);
 
-  /* ===== HEARTBEAT TIMEOUT CHECK (NEW) ===== */
   if (mode != "SEN" &&
       (
         (lastGatewaySeen == 0 && millis() - bootTime > HEARTBEAT_TIMEOUT) ||
@@ -187,7 +198,6 @@ void loop() {
       )
   ) {
     mode = "SEN";
-    Serial.println("[FAILOVER] Gateway missing → SEN MODE");
   }
 
   if (millis() - lastSend > SEND_INTERVAL && loraReady) {
@@ -200,12 +210,12 @@ void loop() {
                      String((int)ema_l) + "," +
                      (pumpStatus ? "1" : "0") + "," +
                      mode + "," +
-                     SECRET_KEY + "," +                     
+                     SECRET_KEY + "," +
                      "0," +
                      String(default_amp, 1) + "," +
                      String(default_flow, 1) + "," +
                      String(last_trigger_soil, 1);
-
+                     
     Serial.println("[LORA][UPLINK] " + payload);
     sendUplink(payload);
   }

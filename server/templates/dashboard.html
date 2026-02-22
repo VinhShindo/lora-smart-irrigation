@@ -3,337 +3,580 @@
 
 <head>
     <meta charset="UTF-8">
-    <title>Smart Garden Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🚀 Smart Garden Center</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
+        :root {
+            --bg-dark: #0f172a;
+            --card-bg: rgba(30, 41, 59, 0.7);
+            --border-color: rgba(148, 163, 184, 0.1);
+            --text-main: #e2e8f0;
+            --text-muted: #94a3b8;
+            --accent-green: #10b981;
+            --accent-red: #ef4444;
+            --accent-blue: #3b82f6;
+            --accent-amber: #f59e0b;
+        }
+
         body {
-            font-family: Arial;
-            background: #0f172a;
-            color: #e5e7eb;
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-dark);
+            background-image:
+                radial-gradient(at 0% 0%, hsla(253, 16%, 7%, 1) 0, transparent 50%),
+                radial-gradient(at 50% 0%, hsla(225, 39%, 30%, 1) 0, transparent 50%),
+                radial-gradient(at 100% 0%, hsla(339, 49%, 30%, 1) 0, transparent 50%);
+            color: var(--text-main);
+            margin: 0;
             padding: 20px;
+            min-height: 100vh;
+        }
+
+        h2 {
+            text-align: center;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--accent-blue);
+            margin-bottom: 30px;
         }
 
         .grid {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 20px;
+            grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+            gap: 24px;
+            max-width: 1600px;
+            margin: 0 auto;
         }
 
         .card {
-            background: #1e293b;
-            padding: 15px;
-            border-radius: 12px;
-            transition: opacity 0.3s;
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 20px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            transition: all 0.3s ease;
         }
 
-        .status {
-            margin: 4px 0;
+        .card.offline {
+            opacity: 0.6;
+            filter: grayscale(0.9);
+            border-color: var(--accent-red);
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 10px;
+            margin-bottom: 15px;
+        }
+
+        .node-name {
+            font-size: 1.2rem;
+            font-weight: 700;
+            color: var(--accent-blue);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .status-badge {
+            font-size: 0.75rem;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-weight: 600;
+        }
+
+        .badge-online {
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--accent-green);
+            border: 1px solid var(--accent-green);
+        }
+
+        .badge-offline {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--accent-red);
+            border: 1px solid var(--accent-red);
+        }
+
+        .data-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+
+        .data-item {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 8px 12px;
+            border-radius: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .data-label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        .data-value {
+            font-weight: 600;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .success {
+            color: var(--accent-green);
+        }
+
+        .warning {
+            color: var(--accent-amber);
+        }
+
+        .control-panel {
+            margin-bottom: 20px;
+            text-align: center;
+        }
+
+        .status-msg {
+            font-size: 0.8rem;
+            margin-bottom: 8px;
+            min-height: 18px;
+            font-weight: 600;
+            color: var(--text-muted);
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 10px;
         }
 
         button {
-            padding: 6px 14px;
-            border-radius: 6px;
+            flex: 1;
+            padding: 10px;
             border: none;
-            margin-right: 5px;
+            border-radius: 8px;
+            font-weight: 700;
             cursor: pointer;
+            text-transform: uppercase;
+        }
+
+        .btn-on {
+            background: var(--accent-green);
+            color: #000;
+        }
+
+        .btn-off {
+            background: var(--accent-red);
+            color: white;
         }
 
         button:disabled {
-            opacity: 0.5;
+            opacity: 0.3;
             cursor: not-allowed;
         }
 
-        .on {
-            background: #22c55e;
+        .sensor-panel {
+            border-top: 1px solid var(--border-color);
+            padding-top: 15px;
         }
 
-        .off {
-            background: #ef4444;
+        .charts-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
         }
 
-        .sensor {
-            margin-top: 10px;
-            font-size: 14px;
+        .chart-box {
+            background: rgba(0, 0, 0, 0.25);
+            border-radius: 10px;
+            padding: 10px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
         }
 
-        canvas {
-            margin-top: 6px;
+        .chart-header-mini {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 5px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            font-family: 'Inter', sans-serif;
+            text-transform: uppercase;
         }
 
-        .pending-wait {
-            color: #facc15;
+        .chart-val-current {
+            font-family: 'JetBrains Mono', monospace;
             font-weight: bold;
         }
 
-        .pending-done {
-            color: #22c55e;
+        .canvas-container {
+            position: relative;
+            width: 100%;
+            height: 100px;
         }
 
-        .node-online {
-            color: #22c55e;
-            font-weight: bold;
+        .status-waiting {
+            color: var(--accent-amber);
+            animation: pulse-text 1.5s infinite;
         }
 
-        .node-offline {
-            color: #ef4444;
-            font-weight: bold;
-        }
-
-        .pending-ready {
-            color: #38bdf8;
-            font-weight: bold;
+        .status-executing {
+            color: var(--accent-green);
         }
     </style>
 </head>
 
 <body>
-
-    <h2>🌱 Smart Garden – 3 Nodes</h2>
-
+    <h2><i class="fa-solid fa-leaf"></i> SMART GARDEN CENTER</h2>
     <div class="grid">
         {% for node in nodes %}
-        <div class="card" id="{{node}}">
-            <h3>{{node}}</h3>
-
-            <!-- NODE STATUS -->
-            <div class="status">
-                🧠 Node: <span class="node-status">--</span>
+        <div class="card offline" id="{{node}}">
+            <div class="card-header">
+                <div class="node-name">{{node}}</div>
+                <div class="status-badge badge-offline node-status-text">OFFLINE</div>
             </div>
 
-            <!-- COMMAND STATUS -->
-            <div class="status">
-                ⏳ Command: <span class="pending pending-ready">READY</span>
+            <div class="data-grid">
+                <div class="data-item">
+                    <span class="data-label">📡 RSSI</span>
+                    <span class="data-value rssi">--</span>
+                </div>
+                <div class="data-item">
+                    <span class="data-label">🔌 Dòng điện</span>
+                    <span class="data-value amp">-- A</span>
+                </div>
+                <div class="data-item">
+                    <span class="data-label">⚙ Bơm</span>
+                    <span class="data-value pump">--</span>
+                </div>
+                <div class="data-item">
+                    <span class="data-label">🌊 Lưu lượng</span>
+                    <span class="data-value flow success">--</span>
+                </div>
+                <div class="data-item">
+                    <span class="data-label">🤖 Chế độ</span>
+                    <span class="data-value mode">--</span>
+                </div>
+                <div class="data-item">
+                    <span class="data-label">⏳ Đã chạy</span>
+                    <span class="data-value duration">0 m</span>
+                </div>
+                <div class="data-item">
+                    <span class="data-label">📉 Ngưỡng đất</span>
+                    <span class="data-value last-soil">--%</span>
+                </div>
+                <div class="data-item">
+                    <span class="data-label">🕒 Updated</span>
+                    <span class="data-value device-updated">--:--:--</span>
+                </div>
+
             </div>
 
-            <!-- DEVICE STATUS -->
-            <div class="status">📡 RSSI: <span class="rssi">--</span> dBm</div>
-            <div class="status">⚙ Pump: <span class="pump">--</span></div>
-            <div class="status">🔁 Mode: <span class="mode">--</span></div>
-            <div class="status">🔌 Current: <span class="amp">--</span> A</div>
-            <div class="status">💧 Flow: <span class="flow">--</span> L/min</div>
-            <div class="status">🌱 Soil at trigger: <span class="soil">--</span> %</div>
-            <div class="status">🕒 Updated: <span class="time">--</span></div>
-            <div class="status">⏱ Runtime: <span class="runtime">--</span> min</div>
-            <div class="status">🎯 Trigger: <span class="trigger">--</span></div>
-            <div class="status">🔄 Prev: <span class="prev-status">--</span></div>
+            <div class="control-panel">
+                <div class="status-msg pending-msg">SYSTEM READY</div>
+                <div class="btn-group">
+                    <button class="btn-on" onclick="sendControl('{{node}}', 'ON')">BẬT</button>
+                    <button class="btn-off" onclick="sendControl('{{node}}', 'OFF')">TẮT</button>
+                </div>
+            </div>
 
-            <button class="on" onclick="control('{{node}}','ON')">BẬT</button>
-            <button class="off" onclick="control('{{node}}','OFF')">TẮT</button>
+            <div class="sensor-panel">
+                <div class="charts-grid">
+                    <div class="chart-box">
+                        <div class="chart-header-mini" style="color: #fca5a5;">
+                            <span><i class="fa-solid fa-temperature-half"></i> Nhiệt độ</span>
+                            <span class="chart-val-current temp-val">--°C</span>
+                        </div>
+                        <div class="canvas-container">
+                            <canvas id="chart-temp-{{node}}"></canvas>
+                        </div>
+                    </div>
 
-            <hr>
+                    <div class="chart-box">
+                        <div class="chart-header-mini" style="color: #93c5fd;">
+                            <span><i class="fa-solid fa-droplet"></i> Độ ẩm</span>
+                            <span class="chart-val-current humi-val">--%</span>
+                        </div>
+                        <div class="canvas-container">
+                            <canvas id="chart-humi-{{node}}"></canvas>
+                        </div>
+                    </div>
 
-            <!-- SENSOR LATEST -->
-            <div class="sensor">🌡 Temp: <b><span class="temp">--</span> °C</b></div>
-            <div class="sensor">💧 Humi: <b><span class="humi">--</span> %</b></div>
-            <div class="sensor">🌱 Soil: <b><span class="soil_m">--</span> %</b></div>
-            <div class="sensor">☀ Light: <b><span class="light">--</span></b></div>
+                    <div class="chart-box">
+                        <div class="chart-header-mini" style="color: #86efac;">
+                            <span><i class="fa-solid fa-seedling"></i> Đất</span>
+                            <span class="chart-val-current soil-val">--%</span>
+                        </div>
+                        <div class="canvas-container">
+                            <canvas id="chart-soil-{{node}}"></canvas>
+                        </div>
+                    </div>
 
-            <canvas id="chart-temp-{{node}}" height="120"></canvas>
-            <canvas id="chart-humi-{{node}}" height="120"></canvas>
-            <canvas id="chart-soil-{{node}}" height="120"></canvas>
-            <canvas id="chart-light-{{node}}" height="120"></canvas>
+                    <div class="chart-box">
+                        <div class="chart-header-mini" style="color: #fcd34d;">
+                            <span><i class="fa-solid fa-sun"></i> Ánh sáng</span>
+                            <span class="chart-val-current light-val">--</span>
+                        </div>
+                        <div class="canvas-container">
+                            <canvas id="chart-light-{{node}}"></canvas>
+                        </div>
+                    </div>
+                </div>
 
+                <div style="text-align: right; font-size: 0.65rem; color: #64748b; margin-top: 8px;">
+                    Cập nhật lúc: <span class="time">--:--:--</span>
+                </div>
+            </div>
         </div>
         {% endfor %}
     </div>
 
     <script>
+        const socket = io();
         const charts = {};
-        const uiLock = {};
-        const pendingWatchdog = {};
-        const COMMAND_TIMEOUT = 5000;
+        const pendingState = {};
+        const watchdogTimers = {};
+        const currentCmdId = {};
 
-        /* ================= CONTROL ================= */
+        Chart.defaults.color = '#64748b';
+        Chart.defaults.borderColor = 'rgba(148, 163, 184, 0.05)';
+        Chart.defaults.font.family = 'Inter';
+        Chart.defaults.font.size = 10;
 
-        function control(node, action) {
-            const el = document.getElementById(node);
-            const p = el.querySelector(".pending");
-
-            p.innerText = "PENDING...";
-            p.className = "pending pending-wait";
-
-            fetch("/control", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ node_id: node, action })
-            }).then(() => {
-                watchPending(node); // 🔥 BẮT ĐẦU THEO DÕI ACK NGAY
-            });
-
-            // watchdog
-            if (pendingWatchdog[node]) clearTimeout(pendingWatchdog[node]);
-            pendingWatchdog[node] = setTimeout(() => {
-                p.innerText = "TIMEOUT";
-                p.className = "pending pending-ready";
-                console.warn(`[WATCHDOG] ${node} timeout`);
-            }, COMMAND_TIMEOUT);
+        function disableControls(el, state) {
+            el.querySelectorAll("button").forEach(b => b.disabled = state);
         }
 
-        /* ================= PENDING WATCHER ================= */
+        function resetControls(el) {
+            const nodeId = el.id;
 
-        function watchPending(node) {
-            fetch(`/api/node/${node}/pending`)
-                .then(r => r.json())
-                .then(d => {
-                    const el = document.getElementById(node);
-                    const p = el.querySelector(".pending");
+            pendingState[nodeId] = false;
+            currentCmdId[nodeId] = null;
 
-                    if (d.pending) {
-                        p.innerText = "EXECUTING...";
-                        p.className = "pending pending-wait";
-
-                        setTimeout(() => watchPending(node), 120);
-                    } else {
-                        clearTimeout(pendingWatchdog[node]);
-
-                        p.innerText = "READY";
-                        p.className = "pending pending-ready";
-
-                        loadFeedback(node); // 🔥 ACK XONG → UPDATE NGAY
-                    }
-                })
-                .catch(() => {
-                    setTimeout(() => watchPending(node), 300);
-                });
-        }
-
-        /* ================= REALTIME FEEDBACK ================= */
-
-        function loadFeedback(node) {
-            fetch(`/api/node/${node}/feedback`)
-                .then(r => r.json())
-                .then(d => {
-                    if (!d.ok) return;
-
-                    const el = document.getElementById(node);
-
-                    uiLock[node] = Date.now(); // 🔒 KHÓA UI TẠM
-
-                    el.querySelector(".pump").innerText = d.pump ?? "--";
-                    el.querySelector(".mode").innerText = d.mode ?? "--";
-                    el.querySelector(".time").innerText =
-                        d.updated_at ? new Date(d.updated_at).toLocaleTimeString() : "--";
-                });
-        }
-
-        /* ================= STATUS (BACKUP ONLY) ================= */
-
-        function loadStatus(node) {
-            fetch(`/api/node/${node}/status`)
-                .then(r => r.json())
-                .then(d => {
-                    const el = document.getElementById(node);
-                    const nodeStatus = el.querySelector(".node-status");
-                    const buttons = el.querySelectorAll("button");
-
-                    if (d.current_status === "OFFLINE") {
-                        nodeStatus.innerText = "OFFLINE";
-                        nodeStatus.className = "node-status node-offline";
-                        el.style.opacity = 0.5;
-                        buttons.forEach(b => b.disabled = true);
-                        return;
-                    }
-
-                    nodeStatus.innerText = "ONLINE";
-                    nodeStatus.className = "node-status node-online";
-                    el.style.opacity = 1;
-                    buttons.forEach(b => b.disabled = false);
-
-                    el.querySelector(".rssi").innerText = d.rssi ?? "--";
-
-                    // ⛔ nếu vừa có feedback thì KHÔNG ghi đè
-                    if (uiLock[node] && Date.now() - uiLock[node] < 2000) {
-                        return;
-                    }
-
-                    el.querySelector(".pump").innerText = d.pump ?? "--";
-                    el.querySelector(".mode").innerText = d.mode ?? "--";
-                    el.querySelector(".amp").innerText = d.amp ?? "--";
-                    el.querySelector(".flow").innerText = d.flow ?? "--";
-                    el.querySelector(".soil").innerText = d.last_soil ?? "--";
-                    el.querySelector(".time").innerText =
-                        d.updated_at ? new Date(d.updated_at).toLocaleTimeString() : "--";
-                    el.querySelector(".runtime").innerText = d.duration_minutes ?? "--";
-                    el.querySelector(".prev-status").innerText = d.previous_status ?? "--";
-
-                    let trigger = d.trigger_source;
-                    if (!trigger) {
-                        if (d.mode === "SEN") trigger = "SENSOR";
-                        else if (d.mode === "CLD") trigger = "CLOUD";
-                        else trigger = "READY";
-                    }
-                    el.querySelector(".trigger").innerText = trigger;
-                });
-        }
-
-        /* ================= MEASUREMENTS ================= */
-
-        function makeChart(id, label, data) {
-            if (!charts[id]) {
-                charts[id] = new Chart(document.getElementById(id), {
-                    type: 'line',
-                    data: {
-                        labels: [],
-                        datasets: [{
-                            label: label,
-                            data: [],
-                            borderColor: '#22c55e'
-                        }]
-                    },
-                    options: { animation: false }
-                });
+            if (watchdogTimers[nodeId]) {
+                clearTimeout(watchdogTimers[nodeId]);
+                delete watchdogTimers[nodeId];
             }
-            charts[id].data.labels = data.labels;
-            charts[id].data.datasets[0].data = data.values;
-            charts[id].update();
+
+            disableControls(el, false);
+
+            const msg = el.querySelector(".pending-msg");
+            msg.innerText = "SYSTEM READY";
+            msg.className = "status-msg";
+            msg.style.color = "";
         }
 
-        function loadMeasurements(node) {
-            fetch(`/api/node/${node}/measurements`)
+        socket.on("connect", () => {
+            {% for node in nodes %}
+            socket.emit("subscribe_node", { node_id: "{{node}}" });
+            pendingState["{{node}}"] = false;
+            currentCmdId["{{node}}"] = null;
+            {% endfor %}
+        });
+
+        function createMiniChart(id, color) {
+            const ctx = document.getElementById(id).getContext('2d');
+            const gradient = ctx.createLinearGradient(0, 0, 0, 100);
+            gradient.addColorStop(0, color + '50');
+            gradient.addColorStop(1, color + '00');
+
+            return new Chart(ctx, {
+                type: 'line',
+                data: { labels: [], datasets: [{ data: [], borderColor: color, borderWidth: 1.5, pointRadius: 0, tension: 0.4, fill: true, backgroundColor: gradient }] },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { display: false },
+                        y: { display: true, position: 'right', ticks: { count: 3, font: { size: 9 }, color: '#475569' }, grid: { display: false } }
+                    },
+                    animation: false
+                }
+            });
+        }
+
+        function updateCharts(nodeId) {
+            fetch(`/api/node/${nodeId}/measurements`)
                 .then(r => r.json())
                 .then(data => {
-                    if (!data.length) return;
-
+                    if (!data || !data.length) return;
                     data.reverse();
-                    const el = document.getElementById(node);
                     const last = data[data.length - 1];
+                    const el = document.getElementById(nodeId);
 
-                    el.querySelector(".temp").innerText = last.temp;
-                    el.querySelector(".humi").innerText = last.humi;
-                    el.querySelector(".soil_m").innerText = last.soil;
-                    el.querySelector(".light").innerText = last.light;
+                    el.querySelector(".temp-val").innerText = last.temp + "°C";
+                    el.querySelector(".humi-val").innerText = last.humi + "%";
+                    el.querySelector(".soil-val").innerText = last.soil + "%";
+                    el.querySelector(".light-val").innerText = last.light;
 
-                    const labels = data.map(x => x.created_at.slice(11, 19));
+                    if (!charts[nodeId]) {
+                        charts[nodeId] = {
+                            temp: createMiniChart(`chart-temp-${nodeId}`, '#fca5a5'),
+                            humi: createMiniChart(`chart-humi-${nodeId}`, '#93c5fd'),
+                            soil: createMiniChart(`chart-soil-${nodeId}`, '#86efac'),
+                            light: createMiniChart(`chart-light-${nodeId}`, '#fcd34d')
+                        };
+                    }
 
-                    makeChart(`chart-temp-${node}`, "Temp (°C)", {
-                        labels, values: data.map(x => x.temp)
-                    });
-                    makeChart(`chart-humi-${node}`, "Humi (%)", {
-                        labels, values: data.map(x => x.humi)
-                    });
-                    makeChart(`chart-soil-${node}`, "Soil (%)", {
-                        labels, values: data.map(x => x.soil)
-                    });
-                    makeChart(`chart-light-${node}`, "Light", {
-                        labels, values: data.map(x => x.light)
-                    });
+                    const labels = data.map(() => "");
+                    const c = charts[nodeId];
+
+                    c.temp.data.labels = labels; c.temp.data.datasets[0].data = data.map(d => d.temp); c.temp.update();
+                    c.humi.data.labels = labels; c.humi.data.datasets[0].data = data.map(d => d.humi); c.humi.update();
+                    c.soil.data.labels = labels; c.soil.data.datasets[0].data = data.map(d => d.soil); c.soil.update();
+                    c.light.data.labels = labels; c.light.data.datasets[0].data = data.map(d => d.light); c.light.update();
                 });
         }
 
-        /* ================= PERIODIC REFRESH (BACKUP) ================= */
+        function sendControl(nodeId, action) {
+            const el = document.getElementById(nodeId);
+            if (el.classList.contains("offline")) return;
+            if (pendingState[nodeId]) return;
 
-        function refresh() {
-            {% for node in nodes %}
-            loadStatus("{{node}}");
-            loadMeasurements("{{node}}");
-            {% endfor %}
+            const statusMsg = el.querySelector(".pending-msg");
+            const cmdId = Date.now().toString();
+
+            pendingState[nodeId] = true;
+            currentCmdId[nodeId] = cmdId;
+
+            statusMsg.innerText = `ĐANG GỬI LỆNH ${action}...`;
+            statusMsg.className = "status-msg status-waiting";
+            statusMsg.style.color = "#f59e0b";
+            disableControls(el, true);
+
+            socket.emit("control", { node_id: nodeId, action, cmd_id: cmdId });
+
+            if (watchdogTimers[nodeId]) clearTimeout(watchdogTimers[nodeId]);
+            watchdogTimers[nodeId] = setTimeout(() => {
+                if (!pendingState[nodeId]) return;
+
+                pendingState[nodeId] = false;
+                currentCmdId[nodeId] = null;
+
+                const el = document.getElementById(nodeId);
+                const statusMsg = el.querySelector(".pending-msg");
+
+                statusMsg.innerText = "TIMEOUT: KHÔNG PHẢN HỒI";
+                statusMsg.className = "status-msg";
+                statusMsg.style.color = "#ef4444";
+
+                disableControls(el, false);
+
+                delete watchdogTimers[nodeId];
+            }, 8000);
         }
 
-        setInterval(refresh, 5000);
-        refresh();
-    </script>
+        socket.on("node_pending", data => {
+            const el = document.getElementById(data.node_id);
+            if (!el) return;
 
+            if (data.cmd_id !== currentCmdId[data.node_id]) return;
+
+            const statusMsg = el.querySelector(".pending-msg");
+            statusMsg.innerText = "EXECUTING...";
+            statusMsg.className = "status-msg status-executing";
+        });
+
+        socket.on("node_ack", data => {
+            const el = document.getElementById(data.node_id);
+            if (!el) return;
+
+            if (data.cmd_id !== currentCmdId[data.node_id]) return;
+
+            const statusMsg = el.querySelector(".pending-msg");
+
+            pendingState[data.node_id] = false;
+            currentCmdId[data.node_id] = null;
+
+            if (watchdogTimers[data.node_id]) {
+                clearTimeout(watchdogTimers[data.node_id]);
+                delete watchdogTimers[data.node_id];
+            }
+
+            disableControls(el, false);
+
+            statusMsg.innerText = "THÀNH CÔNG!";
+            statusMsg.className = "status-msg";
+            statusMsg.style.color = "#10b981";
+
+            setTimeout(() => resetControls(el), 1500);
+        });
+
+        socket.on("node_realtime", data => {
+            const el = document.getElementById(data.node_id);
+            if (!el) return;
+
+            if (pendingState[data.node_id] && data.type === "STATUS") {
+                return;
+            }
+
+            el.querySelector(".rssi").innerText = (data.rssi ?? "--") + " dBm";
+            el.querySelector(".amp").innerText = (data.amp ?? "--") + " A";
+            el.querySelector(".flow").innerText = (data.flow ?? "--") + " L/m";
+            el.querySelector(".pump").innerText = data.pump || "OFF";
+            el.querySelector(".mode").innerText = data.mode || "--";
+            el.querySelector(".duration").innerText = (data.duration_minutes || 0) + " m";
+
+            if (data.last_soil !== undefined && data.last_soil !== null) {
+                el.querySelector(".last-soil").innerText = data.last_soil + "%";
+            }
+
+            el.querySelector(".device-updated").innerText = data.updated_at ? new Date(data.updated_at).toLocaleTimeString() : "--:--:--";
+            el.querySelector(".time").innerText = data.updated_at ? new Date(data.updated_at).toLocaleTimeString() : "--:--:--";
+
+            const modeEl = el.querySelector(".mode");
+            modeEl.style.color = data.mode === "SEN" ? "var(--accent-blue)" : "var(--accent-amber)";
+
+            // if (pendingState[data.node_id] && data.cmd_id && data.cmd_id === currentCmdId[data.node_id]) {
+            //     pendingState[data.node_id] = false;
+            //     currentCmdId[data.node_id] = null;
+            //     if (watchdogTimers[data.node_id]) {
+            //         clearTimeout(watchdogTimers[data.node_id]);
+            //         delete watchdogTimers[data.node_id];
+            //     }
+            //     disableControls(el, false);
+            //     const statusMsg = el.querySelector(".pending-msg");
+            //     statusMsg.innerText = "THÀNH CÔNG!";
+            //     statusMsg.style.color = "#10b981";
+            //     setTimeout(() => resetControls(el), 1500);
+            // }
+
+            if (data.current_status === "OFFLINE") {
+                el.classList.add("offline");
+                el.querySelector(".node-status-text").innerText = "OFFLINE";
+                el.querySelector(".node-status-text").className = "status-badge badge-offline node-status-text";
+                disableControls(el, true);
+                pendingState[data.node_id] = false;
+                currentCmdId[data.node_id] = null;
+            }
+
+            if (data.current_status === "ONLINE") {
+                el.classList.remove("offline");
+                el.querySelector(".node-status-text").innerText = "ONLINE";
+                el.querySelector(".node-status-text").className = "status-badge badge-online node-status-text";
+
+                if (!isPending) {
+                    disableControls(el, false);
+                }
+            }
+        });
+
+        setInterval(() => {
+            {% for node in nodes %} updateCharts("{{node}}"); {% endfor %}
+        }, 10000);
+
+        window.onload = () => {
+            {% for node in nodes %} updateCharts("{{node}}"); {% endfor %}
+        };
+    </script>
 </body>
 
 </html>

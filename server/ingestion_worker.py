@@ -114,7 +114,7 @@ def handle_command_ack(data: dict):
             "updated_at": now_iso()
         })
 
-        rds.set(f"node:status:{node_id}", json.dumps(status), ex=15)
+        rds.set(f"node:ack:{node_id}", json.dumps(status), ex=15)
 
         print(f"[MQTT][ACK] cmd={cmd_id} node={node_id} pump={data.get('pump')}")
 
