@@ -65,12 +65,15 @@ def listen_to_redis_events():
                 if message["type"] != "message":
                     continue
 
+                channel = message["channel"]
                 data = json.loads(message["data"])
 
-                if data.get("type") == "STATUS":
+                # STATUS
+                if channel == "node_updates":
                     socketio.emit("node_realtime", data)
 
-                elif data.get("type") == "ACK":
+                # ACK
+                elif channel == "node_ack":
                     socketio.emit("node_ack", data)
 
         except redis.exceptions.ConnectionError as e:
@@ -121,7 +124,7 @@ def handle_control(data):
         "source": "WEB",
         "ts": now_iso()
     }
-
+    
     rds.set(f"node:pending:{node_id}", cmd_id, ex=20)
     rds.set(
         f"cmd:pending:{cmd_id}",
@@ -150,7 +153,7 @@ def get_measurements_api(node_id):
             .order("created_at", desc=True) \
             .limit(20).execute()
         return jsonify(res.data)
-    except:
+    except: 
         return jsonify([])
 
 if __name__ == "__main__":

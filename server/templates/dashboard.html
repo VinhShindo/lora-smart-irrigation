@@ -341,43 +341,55 @@
     <script>
         const socket = io();
         const charts = {};
-        const pendingState = {};
+        const nodeControlState = {};
         const watchdogTimers = {};
-        const currentCmdId = {};
 
         Chart.defaults.color = '#64748b';
         Chart.defaults.borderColor = 'rgba(148, 163, 184, 0.05)';
         Chart.defaults.font.family = 'Inter';
         Chart.defaults.font.size = 10;
 
-        function disableControls(el, state) {
-            el.querySelectorAll("button").forEach(b => b.disabled = state);
+        function initNodeState(nodeId) {
+            const el = document.getElementById(nodeId);
+            nodeControlState[nodeId] = {
+                state: "IDLE",
+                cmdId: null,
+                statusEl: el ? el.querySelector(".pending-msg") : null
+            };
         }
 
-        function resetControls(el) {
-            const nodeId = el.id;
+        function getStatusEl(nodeId) {
+            return nodeControlState[nodeId]?.statusEl;
+        }
+        
+        function setState(nodeId, newState) {
+            nodeControlState[nodeId].state = newState;
+        }
 
-            pendingState[nodeId] = false;
-            currentCmdId[nodeId] = null;
+        function getState(nodeId) {
+            return nodeControlState[nodeId]?.state || "IDLE";
+        }
 
-            if (watchdogTimers[nodeId]) {
-                clearTimeout(watchdogTimers[nodeId]);
-                delete watchdogTimers[nodeId];
-            }
+        function setCmd(nodeId, cmdId) {
+            nodeControlState[nodeId].cmdId = cmdId;
+        }
 
-            disableControls(el, false);
+        function getCmd(nodeId) {
+            return nodeControlState[nodeId]?.cmdId;
+        }
 
-            const msg = el.querySelector(".pending-msg");
-            msg.innerText = "SYSTEM READY";
-            msg.className = "status-msg";
-            msg.style.color = "";
+        function clearCmd(nodeId) {
+            nodeControlState[nodeId].cmdId = null;
+        }
+
+        function disableControls(el, state) {
+            el.querySelectorAll("button").forEach(b => b.disabled = state);
         }
 
         socket.on("connect", () => {
             {% for node in nodes %}
             socket.emit("subscribe_node", { node_id: "{{node}}" });
-            pendingState["{{node}}"] = false;
-            currentCmdId["{{node}}"] = null;
+            initNodeState("{{node}}");
             {% endfor %}
         });
 
@@ -438,85 +450,143 @@
 
         function sendControl(nodeId, action) {
             const el = document.getElementById(nodeId);
+            if (!el) return;
+
+            if (!nodeControlState[nodeId])
+                initNodeState(nodeId);
+
             if (el.classList.contains("offline")) return;
-            if (pendingState[nodeId]) return;
 
-            const statusMsg = el.querySelector(".pending-msg");
+            console.log("STATE BEFORE SEND:", nodeControlState[nodeId]);
+            if (getState(nodeId) !== "IDLE") return;
+
             const cmdId = Date.now().toString();
+            const statusMsg = getStatusEl(nodeId);;
+            if (!statusMsg) return;
 
-            pendingState[nodeId] = true;
-            currentCmdId[nodeId] = cmdId;
+            setState(nodeId, "SENDING");
+            setCmd(nodeId, cmdId);
+
+            disableControls(el, true);
 
             statusMsg.innerText = `ĐANG GỬI LỆNH ${action}...`;
             statusMsg.className = "status-msg status-waiting";
             statusMsg.style.color = "#f59e0b";
-            disableControls(el, true);
 
             socket.emit("control", { node_id: nodeId, action, cmd_id: cmdId });
 
             if (watchdogTimers[nodeId]) clearTimeout(watchdogTimers[nodeId]);
+
             watchdogTimers[nodeId] = setTimeout(() => {
-                if (!pendingState[nodeId]) return;
 
-                pendingState[nodeId] = false;
-                currentCmdId[nodeId] = null;
+                if (getState(nodeId) !== "SENDING" &&
+                    getState(nodeId) !== "EXECUTING") return;
 
-                const el = document.getElementById(nodeId);
-                const statusMsg = el.querySelector(".pending-msg");
+                setState(nodeId, "TIMEOUT");
+                clearCmd(nodeId);
+                delete watchdogTimers[nodeId];
 
-                statusMsg.innerText = "TIMEOUT: KHÔNG PHẢN HỒI";
+                statusMsg.innerText = "TIMEOUT";
                 statusMsg.className = "status-msg";
                 statusMsg.style.color = "#ef4444";
 
-                disableControls(el, false);
+                if (!el.classList.contains("offline"))
+                    disableControls(el, false);
 
-                delete watchdogTimers[nodeId];
+                setTimeout(() => {
+                    setState(nodeId, "IDLE");
+                    statusMsg.innerText = "SYSTEM READY";
+                    statusMsg.className = "status-msg";
+                    statusMsg.style.color = "";
+                }, 1500);
+
             }, 8000);
         }
 
         socket.on("node_pending", data => {
-            const el = document.getElementById(data.node_id);
+            const nodeId = data.node_id;
+            const el = document.getElementById(nodeId);
             if (!el) return;
 
-            if (data.cmd_id !== currentCmdId[data.node_id]) return;
+            if (data.cmd_id !== getCmd(nodeId)) return;
 
-            const statusMsg = el.querySelector(".pending-msg");
+            setState(nodeId, "EXECUTING");
+
+            const statusMsg = getStatusEl(nodeId);;
+            if (!statusMsg) return;
             statusMsg.innerText = "EXECUTING...";
             statusMsg.className = "status-msg status-executing";
         });
 
         socket.on("node_ack", data => {
-            const el = document.getElementById(data.node_id);
+            const nodeId = data.node_id;
+            const el = document.getElementById(nodeId);
             if (!el) return;
 
-            if (data.cmd_id !== currentCmdId[data.node_id]) return;
+            const currentCmd = getCmd(nodeId);
+            if (!currentCmd) return;
+            if (data.cmd_id !== currentCmd) return;
 
-            const statusMsg = el.querySelector(".pending-msg");
-
-            pendingState[data.node_id] = false;
-            currentCmdId[data.node_id] = null;
-
-            if (watchdogTimers[data.node_id]) {
-                clearTimeout(watchdogTimers[data.node_id]);
-                delete watchdogTimers[data.node_id];
+            if (watchdogTimers[nodeId]) {
+                clearTimeout(watchdogTimers[nodeId]);
+                delete watchdogTimers[nodeId];
             }
+
+            const statusMsg = getStatusEl(nodeId);;
+            if (!statusMsg) return;
+
+            if (data.pump !== undefined)
+                el.querySelector(".pump").innerText = data.pump;
+
+            if (data.mode !== undefined) {
+                const modeEl = el.querySelector(".mode");
+                modeEl.innerText = data.mode;
+                modeEl.style.color =
+                    data.mode === "SEN"
+                        ? "var(--accent-blue)"
+                        : "var(--accent-amber)";
+            }
+
+            if (data.amp !== undefined && data.amp !== null)
+                el.querySelector(".amp").innerText = data.amp + " A";
+
+            if (data.flow !== undefined && data.flow !== null)
+                el.querySelector(".flow").innerText = data.flow + " L/m";
+
+            if (data.last_soil !== undefined && data.last_soil !== null)
+                el.querySelector(".last-soil").innerText = data.last_soil + "%";
+
+            if (data.server_time) {
+                const t = new Date(data.server_time).toLocaleTimeString();
+                el.querySelector(".device-updated").innerText = t;
+                el.querySelector(".time").innerText = t;
+            }
+
+            clearCmd(nodeId);
+            setState(nodeId, "IDLE");
 
             disableControls(el, false);
 
-            statusMsg.innerText = "THÀNH CÔNG!";
-            statusMsg.className = "status-msg";
-            statusMsg.style.color = "#10b981";
+            if (data.success === false) {
+                statusMsg.innerText = data.message || "THẤT BẠI!";
+                statusMsg.className = "status-msg";
+                statusMsg.style.color = "#ef4444";
+            } else {
+                statusMsg.innerText = "THÀNH CÔNG!";
+                statusMsg.className = "status-msg";
+                statusMsg.style.color = "#10b981";
+            }
 
-            setTimeout(() => resetControls(el), 1500);
+            setTimeout(() => {
+                statusMsg.innerText = "SYSTEM READY";
+                statusMsg.className = "status-msg";
+                statusMsg.style.color = "";
+            }, 1500);
         });
 
         socket.on("node_realtime", data => {
             const el = document.getElementById(data.node_id);
             if (!el) return;
-
-            if (pendingState[data.node_id] && data.type === "STATUS") {
-                return;
-            }
 
             el.querySelector(".rssi").innerText = (data.rssi ?? "--") + " dBm";
             el.querySelector(".amp").innerText = (data.amp ?? "--") + " A";
@@ -525,37 +595,27 @@
             el.querySelector(".mode").innerText = data.mode || "--";
             el.querySelector(".duration").innerText = (data.duration_minutes || 0) + " m";
 
-            if (data.last_soil !== undefined && data.last_soil !== null) {
+            if (data.last_soil !== undefined && data.last_soil !== null)
                 el.querySelector(".last-soil").innerText = data.last_soil + "%";
-            }
 
-            el.querySelector(".device-updated").innerText = data.updated_at ? new Date(data.updated_at).toLocaleTimeString() : "--:--:--";
-            el.querySelector(".time").innerText = data.updated_at ? new Date(data.updated_at).toLocaleTimeString() : "--:--:--";
+            const timeStr = data.updated_at
+                ? new Date(data.updated_at).toLocaleTimeString()
+                : "--:--:--";
+
+            el.querySelector(".device-updated").innerText = timeStr;
+            el.querySelector(".time").innerText = timeStr;
 
             const modeEl = el.querySelector(".mode");
-            modeEl.style.color = data.mode === "SEN" ? "var(--accent-blue)" : "var(--accent-amber)";
-
-            // if (pendingState[data.node_id] && data.cmd_id && data.cmd_id === currentCmdId[data.node_id]) {
-            //     pendingState[data.node_id] = false;
-            //     currentCmdId[data.node_id] = null;
-            //     if (watchdogTimers[data.node_id]) {
-            //         clearTimeout(watchdogTimers[data.node_id]);
-            //         delete watchdogTimers[data.node_id];
-            //     }
-            //     disableControls(el, false);
-            //     const statusMsg = el.querySelector(".pending-msg");
-            //     statusMsg.innerText = "THÀNH CÔNG!";
-            //     statusMsg.style.color = "#10b981";
-            //     setTimeout(() => resetControls(el), 1500);
-            // }
+            modeEl.style.color =
+                data.mode === "SEN"
+                    ? "var(--accent-blue)"
+                    : "var(--accent-amber)";
 
             if (data.current_status === "OFFLINE") {
                 el.classList.add("offline");
                 el.querySelector(".node-status-text").innerText = "OFFLINE";
                 el.querySelector(".node-status-text").className = "status-badge badge-offline node-status-text";
                 disableControls(el, true);
-                pendingState[data.node_id] = false;
-                currentCmdId[data.node_id] = null;
             }
 
             if (data.current_status === "ONLINE") {
@@ -563,9 +623,8 @@
                 el.querySelector(".node-status-text").innerText = "ONLINE";
                 el.querySelector(".node-status-text").className = "status-badge badge-online node-status-text";
 
-                if (!isPending) {
+                if (getState(data.node_id) === "IDLE")
                     disableControls(el, false);
-                }
             }
         });
 

@@ -29,6 +29,10 @@ String buffer[MAX_BUF];
 int head = 0, count = 0;  
 SemaphoreHandle_t mutex;
 
+bool waitingAck = false;
+unsigned long ackTimeout = 0;
+String lastCmdId = "";
+
 struct NodeState {
   unsigned long lastSeen;
   int rssi;
@@ -140,18 +144,33 @@ void cmdTask(void* p) {
         continue;
       }
 
+      // Không gửi nếu đang chờ ACK
+      if (waitingAck) {
+        Serial.println("[CMD TASK] Waiting ACK - skip new CMD");
+        continue;
+      }
+
       String loraCmd = "CMD," + item.node + "," + item.cid + "," + item.cmd;
 
       if (xSemaphoreTake(loraMutex, portMAX_DELAY)) {
+
         LoRa.idle();
         delay(2);
+
         LoRa.beginPacket();
         LoRa.print(loraCmd);
         LoRa.endPacket();
+
         delay(5);
         LoRa.receive();
+
         xSemaphoreGive(loraMutex);
       }
+
+      // KÍCH HOẠT CHỜ ACK
+      waitingAck = true;
+      ackTimeout = millis() + 3000;
+      lastCmdId = item.cid;
 
       lastHeartbeatSent = millis();
       Serial.println("[CMD→LORA] " + loraCmd);
@@ -189,11 +208,10 @@ void core0Task(void* p) {
 
         /* ---------- ACK ---------- */
         if (raw.startsWith("ACK")) {
-          Serial.println("[LORA][ACK RX] " + raw);
-
-          String v[6];
+          String v[12];
           int idx = 0, start = 0;
-          for (int i = 0; i < raw.length() && idx < 5; i++) {
+
+          for (int i = 0; i < raw.length() && idx < 11; i++) {
             if (raw[i] == ',') {
               v[idx++] = raw.substring(start, i);
               start = i + 1;
@@ -201,20 +219,42 @@ void core0Task(void* p) {
           }
           v[idx] = raw.substring(start);
 
-          StaticJsonDocument<256> ack;
-          ack["type"]      = "ACK";
-          ack["node_id"]   = v[1];
-          ack["cmd_id"]    = v[2];
-          ack["pump"]      = v[3];
-          ack["mode"]      = v[4];
-          ack["last_soil"] = v[5].toFloat();
+          if (idx < 11) {
+            Serial.println("[ACK ERROR] malformed");
+            continue;
+          }
+
+          StaticJsonDocument<512> ack;
+
+          ack["type"]        = "ACK";
+          ack["node_id"]     = v[1];
+          ack["cmd_id"]      = v[2];
+          if (waitingAck && v[2] == lastCmdId) {
+            waitingAck = false;
+            Serial.println("[ACK] Matched - clear waiting");
+          }
+          ack["success"]     = (v[3] == "1");
+          ack["error_code"]  = v[4];
+          ack["message"]     = v[5];
+          ack["pump"]        = v[6];
+          ack["mode"]        = v[7];
+          ack["flow"]        = v[8].toFloat();
+          ack["amp"]         = v[9].toFloat();
+          ack["last_soil"]   = v[10].toFloat();
+          ack["executed_at"] = v[11];
+
+          ack["rssi"]        = LoRa.packetRssi();
+          ack["gateway_id"]  = "ESP32_GATEWAY_01";
 
           String out;
           serializeJson(ack, out);
-          bool ok = mqtt.publish("garden/control/ack", out.c_str());
-          Serial.println(ok ? "[MQTT][TX ACK] OK" : "[MQTT][TX ACK] FAIL");
 
-          continue; // quay lại vòng lặp, không làm việc khác
+          bool ok = mqtt.publish("garden/control/ack", out.c_str());
+
+          Serial.println(ok ? "[MQTT][TX ACK] OK"
+                            : "[MQTT][TX ACK] FAIL");
+
+          continue;
         }
 
         /* ---------- SENSOR ---------- */
@@ -256,6 +296,7 @@ void core0Task(void* p) {
         status["pump"] = (v[5] == "1") ? "ON" : "OFF";
         status["mode"] = v[6];
         status["rssi"] = rssi;
+        status["uptime"] = v[8].toInt();
         status["amp"] = v[9].toFloat();
         status["flow"] = v[10].toFloat();
         status["last_soil"] = v[11].toFloat();
@@ -314,7 +355,11 @@ void core0Task(void* p) {
       lastLoRaRetry = millis();
       initLoRa();
     }
-
+    // ACK TIMEOUT CHECK
+    if (waitingAck && millis() > ackTimeout) {
+      Serial.println("[ACK] Timeout - clear waiting");
+      waitingAck = false;
+    }
     vTaskDelay(1 / portTICK_PERIOD_MS); // yield CPU
   }
 }

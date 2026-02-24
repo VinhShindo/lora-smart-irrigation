@@ -15,13 +15,43 @@ MQTT_TOPICS = [
 GATEWAY_WHITELIST = {"ESP32_GATEWAY_01"}
 NODE_WHITELIST = {"NODE_01", "NODE_02", "NODE_03"}
 
-REDIS_HOST = "localhost"
+REDIS_HOST = "127.0.0.1"
 REDIS_PORT = 6379
 HTTP_PORT = 5000
+
+MODE_MAP = {
+    "SEN": "SENSOR",
+    "CLD": "CLOUD"
+}
 # =========================================
 
 app = Flask(__name__)
-rds = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+# ✅ Redis cấu hình chuẩn cho Windows + Docker
+def create_redis():
+    return redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        decode_responses=True,
+        socket_keepalive=True,
+        socket_timeout=5,
+        retry_on_timeout=True,
+        health_check_interval=30
+    )
+
+rds = create_redis()
+
+# ---------- REDIS SAFE WRAPPER ----------
+
+def redis_safe_call(func, *args, **kwargs):
+    global rds
+    try:
+        return func(*args, **kwargs)
+    except (redis.exceptions.ConnectionError,
+            redis.exceptions.TimeoutError):
+        print("[REDIS] Reconnecting...")
+        rds = create_redis()
+        return func(*args, **kwargs)
 
 # ---------- HELPERS ----------
 
@@ -48,40 +78,66 @@ def handle_operating_status(data: dict):
         if node_id not in NODE_WHITELIST:
             print(f"[SECURITY] Reject status from {node_id}")
             return
+        
+        old_raw = redis_safe_call(rds.get, f"node:status:{node_id}")
+        old_status = json.loads(old_raw) if old_raw else {}
 
         payload = {
+            "node_id": node_id,
             "rssi": safe_int(data.get("rssi")),
             "pump": data.get("pump"),
             "mode": data.get("mode"),
             "amp": safe_float(data.get("amp")),
             "flow": safe_float(data.get("flow")),
             "last_soil": safe_float(data.get("last_soil")),
+            "uptime": safe_int(data.get("uptime")),
             "current_status": data.get("current_status"),
-            "updated_at": now_iso()
+            "updated_at": now_iso(),
+            "previous_status": "UNKNOWN",
+            "source": "realtime",
+            "type": "STATUS"
         }
 
-        # Realtime cache
-        rds.set(f"node:status:{node_id}", json.dumps(payload), ex=15)
+        redis_safe_call(
+            rds.set,
+            f"node:status:{node_id}",
+            json.dumps(payload),
+            ex=30
+        )
 
-        # DB queues
-        rds.lpush("queue:db:node_status", json.dumps({
-            "node_id": node_id,
-            "rssi": payload["rssi"],
-            "current_status": payload["current_status"],
-            "updated_at": payload["updated_at"]
-        }))
+        redis_safe_call(
+            rds.publish,
+            "node_updates",
+            json.dumps(payload)
+        )
 
-        rds.lpush("queue:db:device_status", json.dumps({
-            "component_id": f"{node_id}_PUMP_01",
-            "node_id": node_id,
-            "component_type": "PUMP",
-            "current_status": payload["pump"],
-            "trigger_source": payload["mode"],
-            "current_consumption": payload["amp"],
-            "flow_rate": payload["flow"],
-            "last_value": payload["last_soil"],
-            "updated_at": payload["updated_at"]
-        }))
+        redis_safe_call(
+            rds.lpush,
+            "queue:db:node_status",
+            json.dumps({
+                "node_id": node_id,
+                "rssi": payload["rssi"],
+                "up_time_sec": payload["uptime"],
+                "current_status": payload["current_status"],
+                "updated_at": payload["updated_at"]
+            })
+        )
+
+        redis_safe_call(
+            rds.lpush,
+            "queue:db:device_status",
+            json.dumps({
+                "component_id": f"{node_id}_PUMP_01",
+                "node_id": node_id,
+                "component_type": "PUMP",
+                "current_status": payload["pump"],
+                "trigger_source": MODE_MAP.get(payload["mode"], "UNKNOWN"),
+                "current_consumption": payload["amp"],
+                "flow_rate": payload["flow"],
+                "last_value": payload["last_soil"],
+                "updated_at": payload["updated_at"]
+            })
+        )
 
         print(f"[MQTT][STATUS] {node_id} pump={payload['pump']} mode={payload['mode']}")
 
@@ -98,36 +154,54 @@ def handle_command_ack(data: dict):
             print("[ACK] Invalid ACK payload")
             return
 
-        rds.delete(f"cmd:pending:{cmd_id}")
-        rds.delete(f"node:pending:{node_id}")
-        
-        # rds.set(f"cmd:feedback:{cmd_id}", json.dumps(data), ex=30)
+        pending_node = redis_safe_call(rds.get, f"cmd:pending:{cmd_id}")
+        if not pending_node:
+            print(f"[ACK] Unknown cmd_id {cmd_id}")
+            return
 
-        # Fast UI update
-        status_raw = rds.get(f"node:status:{node_id}")
-        status = json.loads(status_raw) if status_raw else {}
+        # XÓA pending
+        redis_safe_call(rds.delete, f"cmd:pending:{cmd_id}")
+        redis_safe_call(rds.delete, f"node:pending:{node_id}")
 
-        status.update({
+        ack_payload = {
+            "type": "ACK",
+            "node_id": node_id,
+            "cmd_id": cmd_id,
+
+            # Kết quả thực thi
+            "success": data.get("success", True),  # True / False
+            "error_code": data.get("error_code"),  # VD: RELAY_FAIL, LOW_VOLT
+            "message": data.get("message"),        # Thông báo chi tiết
+
+            # Trạng thái thiết bị sau khi thực thi
             "pump": data.get("pump"),
             "mode": data.get("mode"),
+            "flow": safe_float(data.get("flow")),
+            "amp": safe_float(data.get("amp")),
             "last_soil": safe_float(data.get("last_soil")),
-            "updated_at": now_iso()
-        })
 
-        rds.set(f"node:ack:{node_id}", json.dumps(status), ex=15)
+            # Metadata
+            "executed_at": data.get("executed_at"),
+            "server_time": now_iso()
+        }
 
-        print(f"[MQTT][ACK] cmd={cmd_id} node={node_id} pump={data.get('pump')}")
+        redis_safe_call(
+            rds.publish,
+            "node_ack",
+            json.dumps(ack_payload)
+        )
+
+        print(f"[MQTT][ACK OK] cmd={cmd_id} node={node_id}")
 
     except Exception as e:
         print(f"[ERROR][ACK] {e} data={data}")
 
 # ---------- MQTT CALLBACKS ----------
 
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
+def on_connect(client, userdata, flags, reason_code, properties):
+    if reason_code == 0:
         client.subscribe(MQTT_TOPICS)
         print("[MQTT] Connected & subscribed")
-
 
 def on_message(client, userdata, msg):
     try:
@@ -142,7 +216,7 @@ def on_message(client, userdata, msg):
     elif msg.topic == "garden/control/ack":
         handle_command_ack(data)
 
-# ---------- HTTP INGEST (BATCH) ----------
+# ---------- HTTP INGEST ----------
 
 @app.route("/api/batch", methods=["POST"])
 def ingest_batch():
@@ -158,35 +232,37 @@ def ingest_batch():
             return jsonify({"error": "Missing batch_id"}), 400
 
         batch_key = f"batch:{gateway_id}:{batch_id}"
-        if rds.exists(batch_key):
+
+        if redis_safe_call(rds.exists, batch_key):
             print(f"[HTTP][DUPLICATE] batch_id={batch_id}")
             return jsonify({"status": "duplicate"}), 409
 
-        rds.set(batch_key, now_iso(), ex=3600)
+        redis_safe_call(rds.set, batch_key, now_iso(), ex=3600)
 
         measurements = data.get("measurements", [])
         accepted = 0
 
         for m in measurements:
-            try:
-                node_id = m.get("node_id")
-                if node_id not in NODE_WHITELIST:
-                    continue
+            node_id = m.get("node_id")
+            if node_id not in NODE_WHITELIST:
+                continue
 
-                record = {
-                    "node_id": node_id,
-                    "temp": safe_float(m.get("temp")),
-                    "humi": safe_float(m.get("humi")),
-                    "soil": safe_float(m.get("soil")),
-                    "light": safe_float(m.get("light")),
-                    "created_at": m.get("timestamp") or now_iso()
-                }
+            record = {
+                "node_id": node_id,
+                "temp": safe_float(m.get("temp")),
+                "humi": safe_float(m.get("humi")),
+                "soil": safe_float(m.get("soil")),
+                "light": safe_float(m.get("light")),
+                "created_at": m.get("timestamp") or now_iso()
+            }
 
-                rds.lpush("queue:measurements", json.dumps(record))
-                accepted += 1
+            redis_safe_call(
+                rds.lpush,
+                "queue:measurements",
+                json.dumps(record)
+            )
 
-            except Exception as e:
-                print(f"[HTTP][MEAS DROP] {e} data={m}")
+            accepted += 1
 
         print(f"[HTTP][BATCH OK] gateway={gateway_id} batch={batch_id} records={accepted}")
         return jsonify({"status": "ok", "count": accepted})
@@ -198,14 +274,19 @@ def ingest_batch():
 # ---------- START ----------
 
 def start():
-    mqtt_client = mqtt.Client(client_id="INGESTION_WORKER")
+    mqtt_client = mqtt.Client(
+        client_id="INGESTION_WORKER",
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2
+    )
+
     mqtt_client.on_connect = on_connect
     mqtt_client.on_message = on_message
+
     mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
     mqtt_client.loop_start()
+    mqtt_client.reconnect_delay_set(min_delay=1, max_delay=5)
 
     app.run(host="0.0.0.0", port=HTTP_PORT)
-
 
 if __name__ == "__main__":
     start()

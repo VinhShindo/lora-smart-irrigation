@@ -104,10 +104,10 @@ void setup() {
 void loop() {
 
   /* ===== ADDED: GLOBAL CMD LOCK CHECK ===== */
-  if (cmdProcessing && millis() < cmdLockUntil) {
-    return;
-  }
-  cmdProcessing = false;
+  // if (cmdProcessing && millis() < cmdLockUntil) {
+  //   return;
+  // }
+  // cmdProcessing = false;
   /* ======================================== */
 
   if (loraReady) {
@@ -124,6 +124,14 @@ void loop() {
       }
 
       if (msg.startsWith("CMD")) {
+        if (cmdProcessing && millis() < cmdLockUntil) {
+          Serial.println("[CMD] Locked - ignore new CMD");
+          return;
+        }
+
+        cmdProcessing = true;
+        cmdLockUntil = millis() + 1500;
+
         lastGatewaySeen = millis();
 
         int soil_now = readSoil();
@@ -138,25 +146,52 @@ void loop() {
         action.trim();
 
         if (target == NODE_ID) {
-
-          if (action == "ON") {
-            mode = "CLD";
-            pumpStatus = true;
-          } else if (action == "OFF") {
-            mode = "CLD";
-            pumpStatus = false;
-          } else if (action == "AUTO") {
-            mode = "SEN";
-          }
-
           last_trigger_soil = soil_now;
 
           digitalWrite(PIN_RELAY, pumpStatus);
 
-          String ack = "ACK," + NODE_ID + "," + cmd_id + "," +
-                       (pumpStatus ? "ON" : "OFF") + "," +
-                       mode + "," + String(last_trigger_soil, 1);
+          bool success = true;
+          String errorCode = "";
+          String message = "OK";
 
+          float flow = default_flow;
+          float amp  = default_amp;
+
+          if (action == "ON") {
+            mode = "CLD";
+            pumpStatus = true;
+          }
+          else if (action == "OFF") {
+            mode = "CLD";
+            pumpStatus = false;
+          }
+          else if (action == "AUTO") {
+            mode = "SEN";
+          }
+          else {
+            success = false;
+            errorCode = "INVALID_CMD";
+            message = "Unknown action";
+          }
+
+          digitalWrite(PIN_RELAY, pumpStatus ? LOW : HIGH);
+
+          unsigned long executedAt = millis();
+
+          String ack = "ACK," +
+                      NODE_ID + "," +
+                      cmd_id + "," +
+                      String(success ? "1" : "0") + "," +
+                      errorCode + "," +
+                      message + "," +
+                      (pumpStatus ? "ON" : "OFF") + "," +
+                      mode + "," +
+                      String(flow,1) + "," +
+                      String(amp,1) + "," +
+                      String(last_trigger_soil,1) + "," +
+                      String(executedAt);
+
+          Serial.println("[LORA][TX ACK] " + ack);
           sendUplink(ack);
           lastSend = millis();
 
@@ -202,7 +237,7 @@ void loop() {
 
   if (millis() - lastSend > SEND_INTERVAL && loraReady) {
     lastSend = millis();
-
+    unsigned long uptimeSec = (millis() - bootTime) / 1000;
     String payload = NODE_ID + "," +
                      String(ema_t, 1) + "," +
                      String(ema_h, 1) + "," +
@@ -211,7 +246,7 @@ void loop() {
                      (pumpStatus ? "1" : "0") + "," +
                      mode + "," +
                      SECRET_KEY + "," +
-                     "0," +
+                     String(uptimeSec) + "," +
                      String(default_amp, 1) + "," +
                      String(default_flow, 1) + "," +
                      String(last_trigger_soil, 1);
