@@ -117,7 +117,6 @@ def handle_operating_status(data: dict):
             json.dumps({
                 "node_id": node_id,
                 "rssi": payload["rssi"],
-                "up_time_sec": payload["uptime"],
                 "current_status": payload["current_status"],
                 "updated_at": payload["updated_at"]
             })
@@ -132,9 +131,6 @@ def handle_operating_status(data: dict):
                 "component_type": "PUMP",
                 "current_status": payload["pump"],
                 "trigger_source": MODE_MAP.get(payload["mode"], "UNKNOWN"),
-                "current_consumption": payload["amp"],
-                "flow_rate": payload["flow"],
-                "last_value": payload["last_soil"],
                 "updated_at": payload["updated_at"]
             })
         )
@@ -190,7 +186,11 @@ def handle_command_ack(data: dict):
             "node_ack",
             json.dumps(ack_payload)
         )
-
+        redis_safe_call(
+            rds.lpush,
+            "queue:db:command_history",
+            json.dumps(ack_payload)
+        )
         print(f"[MQTT][ACK OK] cmd={cmd_id} node={node_id}")
 
     except Exception as e:

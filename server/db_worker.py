@@ -70,106 +70,115 @@ while True:
         item = rds.brpop("queue:db:node_status", timeout=1)
 
         if item:
-            try:
-                node = json.loads(item[1])
-                node_id = node["node_id"]
-                now = now_utc()
+            node = json.loads(item[1])
+            node_id = node["node_id"]
+            now = now_utc()
 
-                prev = supabase.table("node_status") \
-                    .select("current_status, last_changed") \
+            prev = supabase.table("node_status") \
+                .select("current_status") \
+                .eq("node_id", node_id) \
+                .execute()
+
+            prev_status = prev.data[0]["current_status"] if prev.data else None
+
+            if prev_status != node["current_status"]:
+
+                supabase.table("node_status_history") \
+                    .update({"ended_at": now}) \
                     .eq("node_id", node_id) \
+                    .is_("ended_at", None) \
                     .execute()
 
-                prev_status = prev.data[0]["current_status"] if prev.data else None
-                last_changed = prev.data[0]["last_changed"] if prev.data else now
-
-                if prev_status != node["current_status"]:
-                    last_changed = now
-
-                duration = 0
-                try:
-                    delta = datetime.fromisoformat(now) - datetime.fromisoformat(last_changed)
-                    duration = int(delta.total_seconds() / 60)
-                except Exception:
-                    pass
-
-                payload = {
+                supabase.table("node_status_history").insert({
                     "node_id": node_id,
-                    "current_status": node["current_status"],
-                    "previous_status": prev_status,
-                    "rssi": safe_float(node.get("rssi")),
-                    "up_time_sec": safe_float(node.get("up_time_sec"), 0),
-                    "last_changed": last_changed,
-                    "duration_minutes": duration,
-                    "updated_at": now
-                }
+                    "status": node["current_status"],
+                    "rssi": node.get("rssi"),
+                    "started_at": now
+                }).execute()
 
-                supabase.table("node_status").upsert(
-                    payload,
-                    on_conflict="node_id"
-                ).execute()
+            payload = {
+                "node_id": node_id,
+                "current_status": node["current_status"],
+                "previous_status": prev_status,
+                "rssi": safe_float(node.get("rssi")),
+                "last_changed": now if prev_status != node["current_status"] else None,
+                "updated_at": now
+            }
 
-                print(f"[DB-NODE] {node_id} = {payload['current_status']}")
+            supabase.table("node_status") \
+                .upsert(payload, on_conflict="node_id") \
+                .execute()
 
-            except Exception as e:
-                print("[NODE-STATUS][ERROR]", e)
+            print(f"[DB-NODE] {node_id} = {payload['current_status']}")
 
         # ==================================================
         # 3️⃣ DEVICE STATUS (PUMP)
         # ==================================================
         item = rds.brpop("queue:db:device_status", timeout=1)
-
         if item:
-            try:
-                dev = json.loads(item[1])
-                cid = dev["component_id"]
-                now = now_utc()
+            dev = json.loads(item[1])
+            cid = dev["component_id"]
+            now = now_utc()
 
-                prev = supabase.table("device_status") \
-                    .select("current_status, last_changed") \
+            prev = supabase.table("device_status") \
+                .select("current_status") \
+                .eq("component_id", cid) \
+                .execute()
+
+            prev_status = prev.data[0]["current_status"] if prev.data else None
+
+            if prev_status != dev["current_status"]:
+
+                supabase.table("device_status_history") \
+                    .update({"ended_at": now}) \
                     .eq("component_id", cid) \
+                    .is_("ended_at", None) \
                     .execute()
 
-                prev_status = prev.data[0]["current_status"] if prev.data else None
-                last_changed = prev.data[0]["last_changed"] if prev.data else now
-
-                if prev_status != dev["current_status"]:
-                    last_changed = now
-
-                duration = 0
-                try:
-                    delta = datetime.fromisoformat(now) - datetime.fromisoformat(last_changed)
-                    duration = int(delta.total_seconds() / 60)
-                except Exception:
-                    pass
-
-                payload = {
+                supabase.table("device_status_history").insert({
                     "component_id": cid,
                     "node_id": dev["node_id"],
-                    "component_type": dev.get("component_type", "PUMP"),
-                    "current_status": dev["current_status"],
-                    "previous_status": prev_status,
+                    "status": dev["current_status"],
                     "trigger_source": dev.get("trigger_source"),
-                    "control_lock": False,
-                    "current_consumption": safe_float(dev.get("current_consumption"), 0),
-                    "flow_rate": safe_float(dev.get("flow_rate"), 0),
-                    "last_value": safe_float(dev.get("last_value")),
-                    "last_changed": last_changed,
-                    "duration_minutes": duration,
-                    "updated_at": now
-                }
+                    "started_at": now
+                }).execute()
 
-                supabase.table("device_status").upsert(
-                    payload,
-                    on_conflict="component_id"
-                ).execute()
+            payload = {
+                "component_id": cid,
+                "node_id": dev["node_id"],
+                "component_type": dev.get("component_type", "PUMP"),
+                "current_status": dev["current_status"],
+                "previous_status": prev_status,
+                "trigger_source": dev.get("trigger_source"),
+                "last_changed": now if prev_status != dev["current_status"] else None,
+                "updated_at": now
+            }
 
-                print(f"[DB-DEVICE] {cid} = {payload['current_status']}")
+            supabase.table("device_status") \
+                .upsert(payload, on_conflict="component_id") \
+                .execute()
 
-            except Exception as e:
-                print("[DEVICE-STATUS][ERROR]", e)
+            print(f"[DB-DEVICE] {cid} = {payload['current_status']}")
 
-        time.sleep(0.3)
+        # ================= COMMAND HISTORY =================
+        item = rds.brpop("queue:db:command_history", timeout=1)
+        if item:
+            cmd = json.loads(item[1])
+
+            supabase.table("command_history").insert({
+                "cmd_id": cmd["cmd_id"],
+                "node_id": cmd["node_id"],
+                "component_id": f"{cmd['node_id']}_PUMP_01",
+                "command": cmd["pump"],
+                "trigger_source": cmd.get("source", "CLOUD"),
+                "success": cmd["success"],
+                "error_code": cmd.get("error_code"),
+                "message": cmd.get("message"),
+                "executed_at": cmd.get("executed_at"),
+                "server_time": cmd.get("server_time")
+            }).execute()
+
+        time.sleep(0.2)
 
     except Exception as e:
         print("[DB-WORKER][FATAL]", e)
