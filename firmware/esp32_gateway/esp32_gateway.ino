@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <map>
 #include <set>
+#include "time.h"
 
 #define LORA_SS    5
 #define LORA_RST   14
@@ -32,6 +33,12 @@ SemaphoreHandle_t mutex;
 bool waitingAck = false;
 unsigned long ackTimeout = 0;
 String lastCmdId = "";
+
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 7 * 3600;  // GMT+7 (VN)
+const int   daylightOffset_sec = 0;
+
+bool ntpReady = false;
 
 struct NodeState {
   unsigned long lastSeen;
@@ -61,6 +68,18 @@ SemaphoreHandle_t loraMutex;
 /* ================= HEARTBEAT STATE (NEW) ================= */
 unsigned long lastHeartbeatSent = 0;
 const unsigned long HEARTBEAT_INTERVAL = 25000;
+
+String getTimeISO() {
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo, 2000)) {
+    return "";
+  }
+
+  char buffer[27];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S+07:00", &timeinfo);
+  return String(buffer);
+}
 
 void initLoRa() {
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
@@ -242,7 +261,7 @@ void core0Task(void* p) {
           ack["amp"]         = v[9].toFloat();
           ack["last_soil"]   = v[10].toFloat();
           ack["executed_at"] = v[11];
-
+          ack["gateway_time"] = getTimeISO();
           ack["rssi"]        = LoRa.packetRssi();
           ack["gateway_id"]  = "ESP32_GATEWAY_01";
 
@@ -301,6 +320,7 @@ void core0Task(void* p) {
         status["flow"] = v[10].toFloat();
         status["last_soil"] = v[11].toFloat();
         status["current_status"] = "ONLINE";
+        status["gateway_time"] = getTimeISO();
 
         String msg;
         serializeJson(status, msg);
@@ -309,7 +329,8 @@ void core0Task(void* p) {
                           : "[MQTT][TX STATUS] FAIL");
 
         xSemaphoreTake(mutex, portMAX_DELAY);
-        buffer[head] = v[0] + "," + v[1] + "," + v[2] + "," + v[3] + "," + v[4];
+        String measuredAt = getTimeISO();
+        buffer[head] = v[0] + "," + v[1] + "," + v[2] + "," + v[3] + "," + v[4] + "," + measuredAt;
         head = (head + 1) % MAX_BUF;
         if (count < MAX_BUF) count++;
         xSemaphoreGive(mutex);
@@ -370,21 +391,30 @@ void core1Task(void* p) {
 
   for (;;) {
     if (count >= 10 && WiFi.status() == WL_CONNECTED) {
+      if (!ntpReady) {
+          Serial.println("[TIME] NTP not ready - skip batch");
+          vTaskDelay(2000 / portTICK_PERIOD_MS);
+          continue;
+      }
       xSemaphoreTake(mutex, portMAX_DELAY);
       int tail = (head - count + MAX_BUF) % MAX_BUF;
 
       DynamicJsonDocument doc(4096);
       doc["gateway_id"] = "ESP32_GATEWAY_01";
       doc["batch_id"] = ++batch_id;
-      doc["sent_at"] = millis();
+      String nowISO = getTimeISO();
+      doc["sent_at"] = nowISO.length() ? nowISO : "1970-01-01T00:00:00";
 
       JsonArray arr = doc.createNestedArray("measurements");
 
       for (int i = 0; i < 10; i++) {
         char id[16];
         float t, h, s, l;
+        char measuredAt[32];
+
         sscanf(buffer[(tail + i) % MAX_BUF].c_str(),
-               "%[^,],%f,%f,%f,%f", id, &t, &h, &s, &l);
+              "%[^,],%f,%f,%f,%f,%[^,\n]",
+              id, &t, &h, &s, &l, measuredAt);
 
         JsonObject o = arr.createNestedObject();
         o["node_id"] = id;
@@ -392,8 +422,9 @@ void core1Task(void* p) {
         o["humi"] = h;
         o["soil"] = s;
         o["light"] = l;
+        o["measured_at"] = measuredAt;
       }
-
+      
       String out;
       serializeJson(doc, out);
       xSemaphoreGive(mutex);
@@ -426,6 +457,8 @@ void core1Task(void* p) {
         off["node_id"] = it.first;
         off["current_status"] = "OFFLINE";
         off["rssi"] = it.second.rssi;
+        off["uptime"] = 0;
+        off["gateway_time"] = getTimeISO();
 
         String msg;
         serializeJson(off, msg);
@@ -454,6 +487,26 @@ void setup() {
   unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) delay(200);
   Serial.println(WiFi.status() == WL_CONNECTED ? "[WIFI] OK" : "[WIFI] FAIL");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    Serial.print("[NTP] Waiting sync");
+
+    for (int i = 0; i < 10; i++) {
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo)) {
+            ntpReady = true;
+            Serial.println(" OK");
+            break;
+        }
+        Serial.print(".");
+        delay(1000);
+    }
+
+    if (!ntpReady) {
+        Serial.println(" FAIL");
+    }
+  }
 
   initLoRa();
 

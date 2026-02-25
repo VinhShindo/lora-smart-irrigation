@@ -31,6 +31,12 @@ rds = redis.Redis(
     socket_timeout=3
 )
 
+def safe_int(v, default=None):
+    try:
+        return int(float(v))
+    except Exception:
+        return default
+
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 print("[DB-WORKER] Started")
@@ -49,13 +55,18 @@ while True:
 
             try:
                 m = json.loads(item[1])
+
+                if m.get("type") and m["type"] != "MEASUREMENT":
+                    print("[MEASUREMENT][DROP] Invalid type:", m.get("type"))
+                    continue
+
                 batch.append({
                     "node_id": m["node_id"],
                     "temp": safe_float(m.get("temp")),
                     "humi": safe_float(m.get("humi")),
                     "soil": safe_float(m.get("soil")),
                     "light": safe_float(m.get("light")),
-                    "created_at": m.get("created_at") or now_utc()
+                    "created_at": m.get("created_at") or now_utc(),
                 })
             except Exception as e:
                 print("[MEASUREMENT][DROP]", e)
@@ -71,8 +82,28 @@ while True:
 
         if item:
             node = json.loads(item[1])
+
+            if node.get("type") != "STATUS":
+                print("[DB-NODE][DROP] Invalid type:", node.get("type"))
+                continue
+
             node_id = node["node_id"]
+
+            if not node_id:
+                print("[DB-NODE][DROP] Missing node_id")
+                continue
+
             now = now_utc()
+
+            exists = supabase.table("devices") \
+                .select("node_id") \
+                .eq("node_id", node_id) \
+                .limit(1) \
+                .execute()
+
+            if not exists.data:
+                print(f"[DB-NODE][SKIP] Unknown node_id={node_id}")
+                continue
 
             prev = supabase.table("node_status") \
                 .select("current_status") \
@@ -92,7 +123,7 @@ while True:
                 supabase.table("node_status_history").insert({
                     "node_id": node_id,
                     "status": node["current_status"],
-                    "rssi": node.get("rssi"),
+                    "rssi": safe_int(node.get("rssi")),
                     "started_at": now
                 }).execute()
 
@@ -100,7 +131,8 @@ while True:
                 "node_id": node_id,
                 "current_status": node["current_status"],
                 "previous_status": prev_status,
-                "rssi": safe_float(node.get("rssi")),
+                "rssi": safe_int(node.get("rssi")),
+                "up_time_sec": node.get("uptime"),
                 "last_changed": now if prev_status != node["current_status"] else None,
                 "updated_at": now
             }
@@ -117,7 +149,15 @@ while True:
         item = rds.brpop("queue:db:device_status", timeout=1)
         if item:
             dev = json.loads(item[1])
+            if dev.get("type") != "DEVICE_STATUS":
+                print("[DB-DEVICE][DROP] Invalid type:", dev.get("type"))
+                continue
+            
             cid = dev["component_id"]
+            if not cid or not node_id:
+                print("[DB-DEVICE][DROP] Missing component_id/node_id")
+                continue
+
             now = now_utc()
 
             prev = supabase.table("device_status") \
@@ -140,6 +180,8 @@ while True:
                     "node_id": dev["node_id"],
                     "status": dev["current_status"],
                     "trigger_source": dev.get("trigger_source"),
+                    "current_consumption": dev.get("amp"),
+                    "flow_rate": dev.get("flow"),
                     "started_at": now
                 }).execute()
 
@@ -164,6 +206,10 @@ while True:
         item = rds.brpop("queue:db:command_history", timeout=1)
         if item:
             cmd = json.loads(item[1])
+            
+            if cmd.get("type") != "ACK":
+                print("[DB-CMD][DROP] Invalid type:", cmd.get("type"))
+                continue
 
             supabase.table("command_history").insert({
                 "cmd_id": cmd["cmd_id"],

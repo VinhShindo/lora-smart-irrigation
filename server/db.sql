@@ -2,7 +2,7 @@
 -- 1️⃣ DANH MỤC NODE
 -- =====================================================
 CREATE TABLE devices (
-    node_id TEXT PRIMARY KEY,                     -- ID duy nhất của node (VD: NODE_01)
+    node_id VARCHAR(50) PRIMARY KEY,              -- ID duy nhất của node (VD: NODE_01)
     node_name TEXT NOT NULL,                      -- Tên hiển thị
     owner TEXT,                                   -- Chủ sở hữu
     location TEXT,                                -- Vị trí
@@ -14,7 +14,7 @@ CREATE TABLE devices (
 -- =====================================================
 CREATE TABLE node_status (
     node_id TEXT PRIMARY KEY REFERENCES devices(node_id) ON DELETE CASCADE,
-    current_status TEXT NOT NULL DEFAULT 'ONLINE', -- ONLINE / OFFLINE / ERROR
+    current_status TEXT CHECK (current_status IN ('ONLINE','OFFLINE','ERROR')), -- ONLINE / OFFLINE / ERROR
     previous_status TEXT,                          -- Trạng thái trước đó
     rssi INTEGER,                                  -- RSSI hiện tại (dBm)
     up_time_sec BIGINT DEFAULT 0,                  -- Uptime firmware gửi (giây)
@@ -39,6 +39,10 @@ CREATE TABLE node_status_history (
 CREATE INDEX idx_node_status_history_node_time
 ON node_status_history(node_id, started_at DESC);
 
+CREATE INDEX idx_node_status_history_active
+ON node_status_history(node_id)
+WHERE ended_at IS NULL;
+
 -- =====================================================
 -- 4️⃣ TRẠNG THÁI HIỆN TẠI THIẾT BỊ
 -- =====================================================
@@ -60,7 +64,7 @@ CREATE TABLE device_status_history (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     component_id TEXT REFERENCES device_status(component_id) ON DELETE CASCADE,
     node_id TEXT REFERENCES devices(node_id),
-    status TEXT NOT NULL,                          -- ON / OFF
+    status TEXT NOT NULL CHECK (status IN ('ON','OFF','ERROR')),                          -- ON / OFF
     trigger_source TEXT,                           -- Ai kích hoạt
     current_consumption FLOAT,                     -- Dòng điện tại thời điểm đó (Ampere)
     flow_rate FLOAT,                               -- Lưu lượng nước (L/phút)
@@ -72,6 +76,10 @@ CREATE TABLE device_status_history (
 CREATE INDEX idx_device_status_history_component_time
 ON device_status_history(component_id, started_at DESC);
 
+CREATE INDEX idx_device_status_history_active
+ON device_status_history(component_id)
+WHERE ended_at IS NULL;
+
 -- =====================================================
 -- 6️⃣ DỮ LIỆU CẢM BIẾN (TIME-SERIES)
 -- =====================================================
@@ -82,7 +90,7 @@ CREATE TABLE measurements (
     humi FLOAT,                                    -- Độ ẩm không khí (%)
     soil FLOAT,                                    -- Độ ẩm đất (%)
     light FLOAT,                                   -- Cường độ ánh sáng
-    created_at TIMESTAMPTZ NOT NULL                -- Thời gian Gateway (UTC)
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()  -- Thời gian Gateway (UTC)
 );
 
 CREATE INDEX idx_measurements_node_time
@@ -95,7 +103,7 @@ CREATE TABLE command_history (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     cmd_id TEXT,                                   -- ID lệnh
     node_id TEXT REFERENCES devices(node_id),
-    component_id TEXT,                             -- Thiết bị nhận lệnh
+    component_id TEXT REFERENCES device_status(component_id),                             -- Thiết bị nhận lệnh
     command TEXT,                                  -- ON / OFF
     trigger_source TEXT,                           -- CLOUD / AUTO
     success BOOLEAN,                               -- TRUE nếu ACK thành công
@@ -108,3 +116,6 @@ CREATE TABLE command_history (
 
 CREATE INDEX idx_command_node_time
 ON command_history(node_id, created_at DESC);
+
+CREATE INDEX idx_command_component_time
+ON command_history(component_id, created_at DESC);

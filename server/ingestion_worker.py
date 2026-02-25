@@ -112,25 +112,30 @@ def handle_operating_status(data: dict):
         )
 
         redis_safe_call(
-            rds.lpush,
-            "queue:db:node_status",
-            json.dumps({
-                "node_id": node_id,
-                "rssi": payload["rssi"],
-                "current_status": payload["current_status"],
-                "updated_at": payload["updated_at"]
-            })
-        )
+                rds.lpush,
+                "queue:db:node_status",
+                json.dumps({
+                    "type": "STATUS",
+                    "node_id": node_id,
+                    "rssi": payload["rssi"],
+                    "current_status": payload["current_status"],
+                    "uptime": payload["uptime"],
+                    "updated_at": payload["updated_at"]
+                })
+            )
 
         redis_safe_call(
             rds.lpush,
             "queue:db:device_status",
             json.dumps({
+                "type": "DEVICE_STATUS",
                 "component_id": f"{node_id}_PUMP_01",
                 "node_id": node_id,
                 "component_type": "PUMP",
                 "current_status": payload["pump"],
                 "trigger_source": MODE_MAP.get(payload["mode"], "UNKNOWN"),
+                "amp": payload.get("amp"),
+                "flow": payload.get("flow"),
                 "updated_at": payload["updated_at"]
             })
         )
@@ -191,6 +196,18 @@ def handle_command_ack(data: dict):
             "queue:db:command_history",
             json.dumps(ack_payload)
         )
+        redis_safe_call(
+            rds.lpush,
+            "queue:db:device_status",
+            json.dumps({
+                "component_id": f"{node_id}_PUMP_01",
+                "node_id": node_id,
+                "component_type": "PUMP",
+                "current_status": data.get("pump"),
+                "trigger_source": "CLOUD",
+                "updated_at": now_iso()
+            })
+        )
         print(f"[MQTT][ACK OK] cmd={cmd_id} node={node_id}")
 
     except Exception as e:
@@ -241,11 +258,14 @@ def ingest_batch():
 
         measurements = data.get("measurements", [])
         accepted = 0
+        batch_time = data.get("sent_at") or now_iso()
 
         for m in measurements:
             node_id = m.get("node_id")
             if node_id not in NODE_WHITELIST:
                 continue
+
+            measured_at = m.get("measured_at") or batch_time
 
             record = {
                 "node_id": node_id,
@@ -253,7 +273,8 @@ def ingest_batch():
                 "humi": safe_float(m.get("humi")),
                 "soil": safe_float(m.get("soil")),
                 "light": safe_float(m.get("light")),
-                "created_at": m.get("timestamp") or now_iso()
+                "created_at": measured_at,
+                "batch_sent_at": batch_time   # nếu muốn lưu
             }
 
             redis_safe_call(

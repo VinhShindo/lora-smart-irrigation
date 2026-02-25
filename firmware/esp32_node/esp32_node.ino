@@ -240,7 +240,7 @@ void loop() {
     unsigned long uptimeSec = (millis() - bootTime) / 1000;
     String payload = NODE_ID + "," +
                      String(ema_t, 1) + "," +
-                     String(ema_h, 1) + "," +
+                     String(ema_h, 1) + "," + 
                      String(cachedSoil) + "," +
                      String((int)ema_l) + "," +
                      (pumpStatus ? "1" : "0") + "," +
