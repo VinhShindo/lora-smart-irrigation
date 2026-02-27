@@ -111,6 +111,9 @@ CREATE TABLE command_history (
     message TEXT,                                  -- Nội dung chi tiết
     executed_at TIMESTAMPTZ,                       -- Node thực thi lúc nào
     server_time TIMESTAMPTZ,                       -- Server nhận ACK lúc nào
+    status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING','SUCCESS','FAILED','TIMEOUT')), -- Trạng thái của command
+    sent_at TIMESTAMPTZ,                           -- Thời điểm server gửi command
+    retry_count INTEGER DEFAULT 0,                 -- Số lần thử lại
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 

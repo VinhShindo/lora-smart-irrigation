@@ -191,15 +191,26 @@ def handle_command_ack(data: dict):
             "node_ack",
             json.dumps(ack_payload)
         )
+
         redis_safe_call(
             rds.lpush,
             "queue:db:command_history",
-            json.dumps(ack_payload)
+            json.dumps({
+                "cmd_id": cmd_id,
+                "status": "SUCCESS" if ack_payload["success"] else "FAILED",
+                "success": ack_payload["success"],
+                "error_code": ack_payload.get("error_code"),
+                "message": ack_payload.get("message"),
+                "executed_at": ack_payload.get("executed_at"),
+                "server_time": ack_payload["server_time"]
+            })
         )
+
         redis_safe_call(
             rds.lpush,
             "queue:db:device_status",
             json.dumps({
+                "type": "DEVICE_STATUS",
                 "component_id": f"{node_id}_PUMP_01",
                 "node_id": node_id,
                 "component_type": "PUMP",
@@ -276,7 +287,7 @@ def ingest_batch():
                 "created_at": measured_at,
                 "batch_sent_at": batch_time   # nếu muốn lưu
             }
-
+    
             redis_safe_call(
                 rds.lpush,
                 "queue:measurements",
@@ -291,6 +302,8 @@ def ingest_batch():
     except Exception as e:
         print(f"[HTTP][ERROR] {e}")
         return jsonify({"error": "server error"}), 500
+
+
 
 # ---------- START ----------
 

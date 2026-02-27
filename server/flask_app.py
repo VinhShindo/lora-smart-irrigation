@@ -80,6 +80,25 @@ def listen_to_redis_events():
             print("[REDIS] Reconnecting in 3s...", e)
             time.sleep(3)
 
+def check_timeout():
+    while True:
+        time.sleep(5)
+
+        pending = supabase.table("command_history") \
+            .select("cmd_id") \
+            .eq("status", "PENDING") \
+            .execute()
+
+        for cmd in pending.data:
+            cmd_id = cmd["cmd_id"]
+
+            if not rds.exists(f"cmd:pending:{cmd_id}"):
+                supabase.table("command_history") \
+                    .update({"status": "TIMEOUT"}) \
+                    .eq("cmd_id", cmd_id) \
+                    .execute()
+
+socketio.start_background_task(check_timeout)
 socketio.start_background_task(listen_to_redis_events)
 
 @app.route("/")
@@ -110,6 +129,18 @@ def handle_control(data):
         return
 
     cmd_id = data.get("cmd_id") or str(uuid.uuid4())
+    component_id = f"{node_id}_PUMP_01"
+
+    supabase.table("command_history").insert({
+        "cmd_id": cmd_id,
+        "node_id": node_id,
+        "component_id": component_id,
+        "command": action,
+        "trigger_source": "CLOUD",
+        "status": "PENDING",
+        "sent_at": now_iso(),
+        "retry_count": 0
+    }).execute()
 
     emit("node_pending", {
         "node_id": node_id,

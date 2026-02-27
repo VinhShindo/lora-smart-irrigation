@@ -72,7 +72,7 @@ while True:
                 print("[MEASUREMENT][DROP]", e)
 
         if batch:
-            supabase.table("measurements").insert(batch).execute()
+            # supabase.table("measurements").insert(batch).execute()
             print(f"[DB] Inserted {len(batch)} measurements")
 
         # ==================================================
@@ -111,7 +111,7 @@ while True:
                 .execute()
 
             prev_status = prev.data[0]["current_status"] if prev.data else None
-
+            # print("[DEBUG CHECK]", node_id, "prev:", prev_status, "new:", node["current_status"]) # debug dữ liệu bảng node_status_history
             if prev_status != node["current_status"]:
 
                 supabase.table("node_status_history") \
@@ -124,19 +124,22 @@ while True:
                     "node_id": node_id,
                     "status": node["current_status"],
                     "rssi": safe_int(node.get("rssi")),
+                    "up_time_sec": node.get("uptime"),
                     "started_at": now
                 }).execute()
-
+                # print("[DEBUG NODE HISTORY]", node) # debug dữ liệu bảng node_status_history
             payload = {
                 "node_id": node_id,
-                "current_status": node["current_status"],
+                "current_status": node["current_status"],   
                 "previous_status": prev_status,
                 "rssi": safe_int(node.get("rssi")),
                 "up_time_sec": node.get("uptime"),
-                "last_changed": now if prev_status != node["current_status"] else None,
                 "updated_at": now
             }
 
+            if prev_status != node["current_status"]:
+                payload["last_changed"] = now
+            
             supabase.table("node_status") \
                 .upsert(payload, on_conflict="node_id") \
                 .execute()
@@ -154,6 +157,7 @@ while True:
                 continue
             
             cid = dev["component_id"]
+            node_id = dev.get("node_id")
             if not cid or not node_id:
                 print("[DB-DEVICE][DROP] Missing component_id/node_id")
                 continue
@@ -192,9 +196,11 @@ while True:
                 "current_status": dev["current_status"],
                 "previous_status": prev_status,
                 "trigger_source": dev.get("trigger_source"),
-                "last_changed": now if prev_status != dev["current_status"] else None,
                 "updated_at": now
             }
+
+            if prev_status != dev["current_status"]:
+                payload["last_changed"] = now
 
             supabase.table("device_status") \
                 .upsert(payload, on_conflict="component_id") \
@@ -206,23 +212,44 @@ while True:
         item = rds.brpop("queue:db:command_history", timeout=1)
         if item:
             cmd = json.loads(item[1])
-            
-            if cmd.get("type") != "ACK":
-                print("[DB-CMD][DROP] Invalid type:", cmd.get("type"))
+
+            cmd_id = cmd.get("cmd_id")
+            if not cmd_id:
+                print("[DB-CMD][DROP] Missing cmd_id")
                 continue
 
-            supabase.table("command_history").insert({
-                "cmd_id": cmd["cmd_id"],
-                "node_id": cmd["node_id"],
-                "component_id": f"{cmd['node_id']}_PUMP_01",
-                "command": cmd["pump"],
-                "trigger_source": cmd.get("source", "CLOUD"),
-                "success": cmd["success"],
+            update_payload = {
+                "status": cmd.get("status"),              # SUCCESS / FAILED
+                "success": cmd.get("success"),
                 "error_code": cmd.get("error_code"),
                 "message": cmd.get("message"),
                 "executed_at": cmd.get("executed_at"),
                 "server_time": cmd.get("server_time")
-            }).execute()
+            }
+
+            supabase.table("command_history") \
+                .update(update_payload) \
+                .eq("cmd_id", cmd_id) \
+                .execute()
+
+            print(f"[DB-CMD] Updated {cmd_id} → {cmd.get('status')}")
+
+        # ================= COMMAND TIMEOUT CHECK =================
+        pending = supabase.table("command_history") \
+            .select("cmd_id") \
+            .eq("status", "PENDING") \
+            .execute()
+
+        for row in pending.data:
+            cmd_id = row["cmd_id"]
+
+            if not rds.exists(f"cmd:pending:{cmd_id}"):
+                supabase.table("command_history") \
+                    .update({"status": "TIMEOUT"}) \
+                    .eq("cmd_id", cmd_id) \
+                    .execute()
+
+                print(f"[DB-CMD] Timeout {cmd_id}")
 
         time.sleep(0.2)
 
