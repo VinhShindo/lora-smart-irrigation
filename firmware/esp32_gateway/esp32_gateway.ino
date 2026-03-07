@@ -88,18 +88,35 @@ void initLoRa() {
     Serial.printf("[LORA] Init attempt %d/%d...\n", i, LORA_RETRY_MAX);
 
     if (xSemaphoreTake(loraMutex, portMAX_DELAY)) {
+
       if (LoRa.begin(433E6)) {
+
+        // ===== CẤU HÌNH RADIO =====
         LoRa.setSyncWord(0xA5);
+
+        LoRa.setSpreadingFactor(9);      // SF7 nhanh nhưng dễ rớt ACK
+                                            // SF9 cân bằng ổn định
+        LoRa.setSignalBandwidth(125E3);  // 125kHz chuẩn
+        LoRa.setCodingRate4(5);          // 4/5 (mặc định nhưng set lại cho chắc)
+        LoRa.setTxPower(17);             // SX1278 max ~17dBm
+        LoRa.setPreambleLength(8);
+        LoRa.enableCrc();
+
         LoRa.receive();
+
         loraReady = true;
-        Serial.println("[LORA] Initialized OK");
+        Serial.println("[LORA] Initialized OK (Configured)");
+
         xSemaphoreGive(loraMutex);
         return;
       }
+
       xSemaphoreGive(loraMutex);
     }
+
     delay(1000);
   }
+
   Serial.println("[LORA][FAIL] Running without LoRa (will retry later)");
   loraReady = false;
 }
@@ -123,6 +140,21 @@ void mqttReconnect() {
   }
 }
 
+void wifiReconnect() {
+
+  static unsigned long lastTry = 0;
+
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  if (millis() - lastTry < 5000) return;
+
+  lastTry = millis();
+
+  Serial.println("[WIFI] Reconnecting...");
+
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
 
 void mqttCallback(char* topic, byte* payload, unsigned int len) {
   Serial.printf("[MQTT][RX CMD] topic=%s\n", topic);
@@ -165,8 +197,8 @@ void cmdTask(void* p) {
 
       // Không gửi nếu đang chờ ACK
       if (waitingAck) {
-        Serial.println("[CMD TASK] Waiting ACK - skip new CMD");
-        continue;
+          Serial.println("[CMD TASK] Waiting ACK - skip new CMD");
+          continue;  // BẮT BUỘC
       }
 
       String loraCmd = "CMD," + item.node + "," + item.cid + "," + item.cmd;
@@ -178,9 +210,7 @@ void cmdTask(void* p) {
 
         LoRa.beginPacket();
         LoRa.print(loraCmd);
-        LoRa.endPacket();
-
-        delay(5);
+        LoRa.endPacket(true);
         LoRa.receive();
 
         xSemaphoreGive(loraMutex);
@@ -188,7 +218,7 @@ void cmdTask(void* p) {
 
       // KÍCH HOẠT CHỜ ACK
       waitingAck = true;
-      ackTimeout = millis() + 3000;
+      ackTimeout = millis() + 8000;
       lastCmdId = item.cid;
 
       lastHeartbeatSent = millis();
@@ -204,7 +234,25 @@ void core0Task(void* p) {
   Serial.println("[CORE0] Real-time task started");
 
   for (;;) {
+    static unsigned long lastNtpTry = 0;
+    if (WiFi.status() == WL_CONNECTED && !ntpReady &&
+        millis() - lastNtpTry > 10000) {
 
+        lastNtpTry = millis();
+
+        Serial.println("[NTP] Retry sync");
+
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+        struct tm timeinfo;
+
+        if (getLocalTime(&timeinfo, 3000)) {
+            ntpReady = true;
+            Serial.println("[NTP] Sync OK");
+        } else {
+            Serial.println("[NTP] Sync fail");
+        }
+    }
     /* ======================================================
      * P0 – LoRa RX (ƯU TIÊN CAO NHẤT)
      * ====================================================== */
@@ -248,9 +296,13 @@ void core0Task(void* p) {
           ack["type"]        = "ACK";
           ack["node_id"]     = v[1];
           ack["cmd_id"]      = v[2];
-          if (waitingAck && v[2] == lastCmdId) {
-            waitingAck = false;
-            Serial.println("[ACK] Matched - clear waiting");
+          if (waitingAck) {
+              if (v[2] == lastCmdId) {
+                  waitingAck = false;
+                  Serial.println("[ACK MATCHED] OK");
+              } else {
+                  Serial.println("[ACK MISMATCH]");
+              }
           }
           ack["success"]     = (v[3] == "1");
           ack["error_code"]  = v[4];
@@ -268,10 +320,16 @@ void core0Task(void* p) {
           String out;
           serializeJson(ack, out);
 
-          bool ok = mqtt.publish("garden/control/ack", out.c_str());
+          if (mqtt.connected()) {
+              bool ok = mqtt.publish("garden/control/ack", out.c_str());
+              Serial.println(ok ? "[MQTT][TX ACK] OK"
+                                : "[MQTT][TX ACK] FAIL");
+          } else {
+              Serial.println("[MQTT] Not connected - ACK dropped");
+          }
 
-          Serial.println(ok ? "[MQTT][TX ACK] OK"
-                            : "[MQTT][TX ACK] FAIL");
+          // Serial.println(ok ? "[MQTT][TX ACK] OK"
+          //                   : "[MQTT][TX ACK] FAIL");
 
           continue;
         }
@@ -320,7 +378,8 @@ void core0Task(void* p) {
         status["flow"] = v[10].toFloat();
         status["last_soil"] = v[11].toFloat();
         status["current_status"] = "ONLINE";
-        status["gateway_time"] = getTimeISO();
+        String t = getTimeISO();
+        status["gateway_time"] = t.length() ? t : "1970-01-01T00:00:00";
 
         String msg;
         serializeJson(status, msg);
@@ -346,6 +405,7 @@ void core0Task(void* p) {
     /* ======================================================
      * P1 – MQTT (CHỈ CHẠY KHI KHÔNG CÓ RX)
      * ====================================================== */
+    wifiReconnect();
     mqttReconnect();
     mqtt.loop();
 
@@ -361,7 +421,7 @@ void core0Task(void* p) {
       LoRa.beginPacket();
       LoRa.print("HB,GW_01");
       LoRa.endPacket();
-      delay(5);
+      // delay(5);
       LoRa.receive();
 
       lastHeartbeatSent = millis();
@@ -391,10 +451,15 @@ void core1Task(void* p) {
 
   for (;;) {
     if (count >= 10 && WiFi.status() == WL_CONNECTED) {
-      if (!ntpReady) {
-          Serial.println("[TIME] NTP not ready - skip batch");
-          vTaskDelay(2000 / portTICK_PERIOD_MS);
-          continue;
+      // if (!ntpReady) {
+      //     Serial.println("[TIME] NTP not ready - skip batch");
+      //     vTaskDelay(2000 / portTICK_PERIOD_MS);
+      //     continue;
+      // }
+      String nowISO = getTimeISO();
+
+      if (nowISO == "") {
+          nowISO = "1970-01-01T00:00:00";
       }
       xSemaphoreTake(mutex, portMAX_DELAY);
       int tail = (head - count + MAX_BUF) % MAX_BUF;
@@ -402,7 +467,6 @@ void core1Task(void* p) {
       DynamicJsonDocument doc(4096);
       doc["gateway_id"] = "ESP32_GATEWAY_01";
       doc["batch_id"] = ++batch_id;
-      String nowISO = getTimeISO();
       doc["sent_at"] = nowISO.length() ? nowISO : "1970-01-01T00:00:00";
 
       JsonArray arr = doc.createNestedArray("measurements");
@@ -413,8 +477,8 @@ void core1Task(void* p) {
         char measuredAt[32];
 
         sscanf(buffer[(tail + i) % MAX_BUF].c_str(),
-              "%[^,],%f,%f,%f,%f,%[^,\n]",
-              id, &t, &h, &s, &l, measuredAt);
+          "%15[^,],%f,%f,%f,%f,%31[^,\n]",
+          id, &t, &h, &s, &l, measuredAt);
 
         JsonObject o = arr.createNestedObject();
         o["node_id"] = id;
@@ -432,6 +496,7 @@ void core1Task(void* p) {
       Serial.println("[HTTP] POST attempt:\n" + out);
 
       HTTPClient http;
+      http.setTimeout(5000);
       http.begin(API_URL);
       http.addHeader("Content-Type", "application/json");
       int code = http.POST(out);
@@ -462,7 +527,9 @@ void core1Task(void* p) {
 
         String msg;
         serializeJson(off, msg);
-        mqtt.publish("garden/status", msg.c_str(), false);
+        if (mqtt.connected()) {
+            mqtt.publish("garden/status", msg.c_str(), false);
+        }
 
         Serial.println("[NODE OFFLINE] " + it.first);
       }
@@ -474,6 +541,8 @@ void core1Task(void* p) {
 
 void setup() {
   Serial.begin(115200);
+  mqtt.setBufferSize(1024);
+
   Serial.println("\n=== ESP32 GARDEN GATEWAY ===");
 
   mutex = xSemaphoreCreateMutex();
@@ -484,9 +553,25 @@ void setup() {
   }
 
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) delay(200);
-  Serial.println(WiFi.status() == WL_CONNECTED ? "[WIFI] OK" : "[WIFI] FAIL");
+  Serial.print("[WIFI] Connecting");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+
+      if (millis() - start > 20000) {
+          Serial.println("\n[WIFI] TIMEOUT");
+          break;
+      }
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\n[WIFI] OK");
+      Serial.println(WiFi.localIP());
+  } else {
+      Serial.println("[WIFI] FAIL");
+  }
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
 
   if (WiFi.status() == WL_CONNECTED) {
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);

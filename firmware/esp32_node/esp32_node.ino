@@ -48,15 +48,29 @@ void initLoRa() {
 
   for (int i = 1; i <= LORA_RETRY_MAX; i++) {
     Serial.printf("[LORA] Đang thử kết nối lần %d/%d...\n", i, LORA_RETRY_MAX);
+
     if (LoRa.begin(433E6)) {
+
+      // ===== CẤU HÌNH RADIO (PHẢI GIỐNG GATEWAY) =====
       LoRa.setSyncWord(0xA5);
+
+      LoRa.setSpreadingFactor(9);
+      LoRa.setSignalBandwidth(125E3);
+      LoRa.setCodingRate4(5);
+      LoRa.setTxPower(17);
+      LoRa.setPreambleLength(8);
+      LoRa.enableCrc();
+
       LoRa.receive();
+
       loraReady = true;
-      Serial.println("[LORA] Khởi tạo THÀNH CÔNG");
+      Serial.println("[LORA] Khởi tạo THÀNH CÔNG (Configured)");
       return;
     }
+
     delay(1000);
   }
+
   Serial.println("[LORA][LỖI] Không tìm thấy module LoRa. Đang thử lại...");
   loraReady = false;
 }
@@ -195,10 +209,10 @@ void loop() {
           sendUplink(ack);
           lastSend = millis();
 
-          /* ===== ADDED: ACTIVATE LOCK AFTER CMD ===== */
-          cmdProcessing = true;
-          cmdLockUntil = millis() + CMD_LOCK_TIME;
-          /* ========================================== */
+          // cmdProcessing = true;
+          // cmdLockUntil = millis() + CMD_LOCK_TIME;
+
+          cmdProcessing = false;
 
         }
       }
@@ -235,7 +249,7 @@ void loop() {
     mode = "SEN";
   }
 
-  if (millis() - lastSend > SEND_INTERVAL && loraReady) {
+  if (!cmdProcessing && millis() - lastSend > SEND_INTERVAL && loraReady) {
     lastSend = millis();
     unsigned long uptimeSec = (millis() - bootTime) / 1000;
     String payload = NODE_ID + "," +
