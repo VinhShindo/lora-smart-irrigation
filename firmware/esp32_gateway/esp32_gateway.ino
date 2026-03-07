@@ -32,7 +32,7 @@ SemaphoreHandle_t mutex;
 
 bool waitingAck = false;
 unsigned long ackTimeout = 0;
-String lastCmdId = "";
+char lastCmdId[32] = "";  
 
 const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 7 * 3600;  // GMT+7 (VN)
@@ -48,7 +48,7 @@ struct NodeState {
 
 std::map<String, NodeState> nodeRegistry;
 
-std::set<String> whitelist = {
+const char* whitelist[] = {
   "NODE_01",
   "NODE_02",
   "NODE_03"
@@ -57,9 +57,9 @@ std::set<String> whitelist = {
 #define CMD_QUEUE_SIZE 10
 
 struct CmdItem {
-  String node;
-  String cmd;
-  String cid;
+  char node[16];
+  char cmd[16];
+  char cid[32];
 };
 
 QueueHandle_t cmdQueue;
@@ -79,6 +79,13 @@ String getTimeISO() {
   char buffer[27];
   strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S+07:00", &timeinfo);
   return String(buffer);
+}
+
+bool isWhitelisted(const char* node) {
+  for (int i = 0; i < 3; i++) {
+    if (strcmp(node, whitelist[i]) == 0) return true;
+  }
+  return false;
 }
 
 void initLoRa() {
@@ -165,14 +172,14 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
   }
 
   CmdItem item;
-  item.node = doc["node_id"].as<String>();
-  item.cmd  = doc["action"].as<String>();
-  item.cid  = doc["cmd_id"].as<String>();
+  strncpy(item.node, doc["node_id"], sizeof(item.node));
+  strncpy(item.cmd,  doc["action"], sizeof(item.cmd));
+  strncpy(item.cid,  doc["cmd_id"], sizeof(item.cid));
 
   Serial.printf("[MQTT][CMD DATA] node=%s cmd=%s cid=%s\n",
-                item.node.c_str(), item.cmd.c_str(), item.cid.c_str());
+                item.node, item.cmd, item.cid);
 
-  if (!whitelist.count(item.node)) {
+  if (!isWhitelisted(item.node)) {
     Serial.println("[SECURITY] CMD rejected");
     return;
   }
@@ -201,7 +208,13 @@ void cmdTask(void* p) {
           continue;  // BẮT BUỘC
       }
 
-      String loraCmd = "CMD," + item.node + "," + item.cid + "," + item.cmd;
+      char loraCmd[128];
+
+      snprintf(loraCmd, sizeof(loraCmd),
+      "CMD,%s,%s,%s",
+      item.node,
+      item.cid,
+      item.cmd);
 
       if (xSemaphoreTake(loraMutex, portMAX_DELAY)) {
 
@@ -219,10 +232,11 @@ void cmdTask(void* p) {
       // KÍCH HOẠT CHỜ ACK
       waitingAck = true;
       ackTimeout = millis() + 8000;
-      lastCmdId = item.cid;
+      strncpy(lastCmdId, item.cid, sizeof(lastCmdId));
 
       lastHeartbeatSent = millis();
-      Serial.println("[CMD→LORA] " + loraCmd);
+      Serial.print("[CMD→LORA] ");
+      Serial.println(loraCmd);
     }
   }
 }
@@ -269,24 +283,23 @@ void core0Task(void* p) {
           buf[i++] = (char)LoRa.read();
         }
         buf[i] = '\0';
-        String raw = buf;
+        // String raw = buf;
 
         xSemaphoreGive(loraMutex);
 
         /* ---------- ACK ---------- */
-        if (raw.startsWith("ACK")) {
-          String v[12];
-          int idx = 0, start = 0;
+        if (strncmp(buf, "ACK", 3) == 0) {
+          char* v[12];
+          // int idx = 0, start = 0;
+          int idx = 0;
+          char* token = strtok(buf, ",");
 
-          for (int i = 0; i < raw.length() && idx < 11; i++) {
-            if (raw[i] == ',') {
-              v[idx++] = raw.substring(start, i);
-              start = i + 1;
-            }
+          while (token != NULL && idx < 12) {
+              v[idx++] = token;
+              token = strtok(NULL, ",");
           }
-          v[idx] = raw.substring(start);
 
-          if (idx < 11) {
+          if (idx < 8) {
             Serial.println("[ACK ERROR] malformed");
             continue;
           }
@@ -297,31 +310,31 @@ void core0Task(void* p) {
           ack["node_id"]     = v[1];
           ack["cmd_id"]      = v[2];
           if (waitingAck) {
-              if (v[2] == lastCmdId) {
+              if (strcmp(v[2], lastCmdId) == 0) {
                   waitingAck = false;
                   Serial.println("[ACK MATCHED] OK");
               } else {
                   Serial.println("[ACK MISMATCH]");
               }
           }
-          ack["success"]     = (v[3] == "1");
+          ack["success"]     = (strcmp(v[3], "1") == 0);
           ack["error_code"]  = v[4];
           ack["message"]     = v[5];
           ack["pump"]        = v[6];
           ack["mode"]        = v[7];
-          ack["flow"]        = v[8].toFloat();
-          ack["amp"]         = v[9].toFloat();
-          ack["last_soil"]   = v[10].toFloat();
-          ack["executed_at"] = v[11];
+          ack["flow"] = (idx > 8) ? atof(v[8]) : 0;
+          ack["amp"] = (idx > 9) ? atof(v[9]) : 0;
+          ack["last_soil"] = (idx > 10) ? atof(v[10]) : 0;
+          ack["executed_at"] = (idx > 11) ? v[11] : "0";
           ack["gateway_time"] = getTimeISO();
           ack["rssi"]        = LoRa.packetRssi();
           ack["gateway_id"]  = "ESP32_GATEWAY_01";
 
-          String out;
+          char out[512];
           serializeJson(ack, out);
 
           if (mqtt.connected()) {
-              bool ok = mqtt.publish("garden/control/ack", out.c_str());
+              bool ok = mqtt.publish("garden/control/ack", out);
               Serial.println(ok ? "[MQTT][TX ACK] OK"
                                 : "[MQTT][TX ACK] FAIL");
           } else {
@@ -335,23 +348,23 @@ void core0Task(void* p) {
         }
 
         /* ---------- SENSOR ---------- */
-        String v[12];
-        int idx = 0, start = 0;
-        for (int i = 0; i < raw.length() && idx < 11; i++) {
-          if (raw[i] == ',') {
-            v[idx++] = raw.substring(start, i);
-            start = i + 1;
-          }
+        char* v[12];
+        // int idx = 0, start = 0;
+        int idx = 0;
+        char* token = strtok(buf, ",");
+
+        while (token != NULL && idx < 12) {
+            v[idx++] = token;
+            token = strtok(NULL, ",");
         }
-        v[idx] = raw.substring(start);
 
         if (idx < 11) {
           Serial.println("[ERROR] SENSOR malformed");
           continue;
         }
 
-        String node = v[0];
-        if (!whitelist.count(node)) {
+        const char* node = v[0];
+        if (!isWhitelisted(node)) {
           Serial.println("[SECURITY] SENSOR rejected (not in whitelist)");
           continue;
         }
@@ -364,32 +377,43 @@ void core0Task(void* p) {
         nodeRegistry[node].online = true;
 
         if (!existed || wasOffline) {
-          Serial.println("[NODE ONLINE] " + node);
+          Serial.print("[NODE ONLINE] ");
+          Serial.println(node);
         }
 
         StaticJsonDocument<512> status;
         status["type"] = "STATUS";
         status["node_id"] = node;
-        status["pump"] = (v[5] == "1") ? "ON" : "OFF";
+        status["pump"] = (strcmp(v[5], "1") == 0) ? "ON" : "OFF";
         status["mode"] = v[6];
         status["rssi"] = rssi;
-        status["uptime"] = v[8].toInt();
-        status["amp"] = v[9].toFloat();
-        status["flow"] = v[10].toFloat();
-        status["last_soil"] = v[11].toFloat();
+        status["uptime"] = atoi(v[7]);
+        status["amp"] = atof(v[8]);
+        status["flow"] = atof(v[9]);
+        status["last_soil"] = atof(v[10]);
         status["current_status"] = "ONLINE";
         String t = getTimeISO();
         status["gateway_time"] = t.length() ? t : "1970-01-01T00:00:00";
 
-        String msg;
+        char msg[512];
         serializeJson(status, msg);
-        bool ok = mqtt.publish("garden/status", msg.c_str(), false);
-        Serial.println(ok ? "[MQTT][TX STATUS] " + msg
-                          : "[MQTT][TX STATUS] FAIL");
+        bool ok = mqtt.publish("garden/status", msg, false);
+        if (ok) {
+            Serial.print("[MQTT][TX STATUS] ");
+            Serial.println(msg);
+        } else {
+            Serial.println("[MQTT][TX STATUS] FAIL");
+        }
 
         xSemaphoreTake(mutex, portMAX_DELAY);
         String measuredAt = getTimeISO();
-        buffer[head] = v[0] + "," + v[1] + "," + v[2] + "," + v[3] + "," + v[4] + "," + measuredAt;
+        char line[128];
+
+        snprintf(line, sizeof(line),
+        "%s,%s,%s,%s,%s,%s",
+        v[0], v[1], v[2], v[3], v[4], measuredAt.c_str());
+
+        buffer[head] = line;
         head = (head + 1) % MAX_BUF;
         if (count < MAX_BUF) count++;
         xSemaphoreGive(mutex);
@@ -413,8 +437,9 @@ void core0Task(void* p) {
      * P2 – HEARTBEAT (ƯU TIÊN THẤP NHẤT)
      * ====================================================== */
     if (loraReady &&
-        millis() - lastHeartbeatSent > HEARTBEAT_INTERVAL &&
-        xSemaphoreTake(loraMutex, 0)) {
+      !waitingAck &&
+      millis() - lastHeartbeatSent > HEARTBEAT_INTERVAL &&
+      xSemaphoreTake(loraMutex, 0)) {
 
       LoRa.idle();
       delay(2);
@@ -493,7 +518,8 @@ void core1Task(void* p) {
       serializeJson(doc, out);
       xSemaphoreGive(mutex);
 
-      Serial.println("[HTTP] POST attempt:\n" + out);
+      Serial.println("[HTTP] POST attempt:");
+      Serial.println(out);
 
       HTTPClient http;
       http.setTimeout(5000);

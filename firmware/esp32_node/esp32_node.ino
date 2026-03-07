@@ -10,8 +10,7 @@
 #define PIN_LDR        35
 #define PIN_RELAY      22
 
-const String NODE_ID = "NODE_01";
-const String SECRET_KEY = "12345";
+const char NODE_ID[] = "NODE_01";
 
 const unsigned long SEND_INTERVAL = 5000;
 const int LORA_RETRY_MAX = 5;
@@ -25,7 +24,7 @@ float ema_t = 0, ema_h = 0, ema_l = 0;
 float alpha = 0.1;
 
 bool pumpStatus = false;
-String mode = "READY";
+char mode[8] = "READY";
 
 float default_amp = 0.5;
 float default_flow = 1.2;
@@ -87,19 +86,33 @@ void processSensors() {
 }
 
 int readSoil() {
+
   long sum = 0;
+
   for (int i = 0; i < 10; i++) {
-    sum += analogRead(PIN_SOIL);
+    int v = analogRead(PIN_SOIL);
+
+    if (v < 100) v = 100;
+    if (v > 4000) v = 4000;
+
+    sum += v;
     delay(5);
   }
-  return constrain(map(sum / 10, 4095, 1000, 0, 100), 0, 100);
+  int raw = sum / 10;
+  int soil = map(raw, 4095, 1000, 0, 100);
+  soil = constrain(soil, 0, 100);
+  return soil;
 }
 
-bool sendUplink(String data) {
+bool sendUplink(const char* data) {
   if (!loraReady) return false;
+
   LoRa.beginPacket();
   LoRa.print(data);
-  LoRa.endPacket();
+  LoRa.endPacket(true);   // wait TX done
+
+  delay(120);              // radio settle
+
   LoRa.receive();
   return true;
 }
@@ -127,17 +140,24 @@ void loop() {
   if (loraReady) {
     int packetSize = LoRa.parsePacket();
     if (packetSize) {
-      String msg = "";
-      while (LoRa.available()) msg += (char)LoRa.read();
+      char msg[128];
+      int i = 0;
 
-      Serial.println("[LORA][RX] Nhận lệnh: " + msg);
+      while (LoRa.available() && i < 127) {
+        msg[i++] = (char)LoRa.read();
+      }
 
-      if (msg.startsWith("HB")) {
+      msg[i] = '\0';
+
+      Serial.print("[LORA][RX] Nhận lệnh: ");
+      Serial.println(msg);
+
+      if (strncmp(msg, "HB", 2) == 0) {
         lastGatewaySeen = millis();
         Serial.println("[HB] RX");
       }
 
-      if (msg.startsWith("CMD")) {
+      if (strncmp(msg,"CMD",3)==0) {
         if (cmdProcessing && millis() < cmdLockUntil) {
           Serial.println("[CMD] Locked - ignore new CMD");
           return;
@@ -150,37 +170,44 @@ void loop() {
 
         int soil_now = readSoil();
 
-        int p1 = msg.indexOf(',');
-        int p2 = msg.indexOf(',', p1 + 1);
-        int p3 = msg.indexOf(',', p2 + 1);
+        char* v[4];
+        int idx = 0;
 
-        String target = msg.substring(p1 + 1, p2);
-        String cmd_id = msg.substring(p2 + 1, p3);
-        String action = msg.substring(p3 + 1);
-        action.trim();
+        char* token = strtok(msg, ",");
 
-        if (target == NODE_ID) {
+        while (token && idx < 4) {
+          v[idx++] = token;
+          token = strtok(NULL, ",");
+        }
+
+        if (idx < 4) return;
+
+        const char* target = v[1];
+        const char* cmd_id = v[2];
+        const char* action = v[3];
+
+        if (strcmp(target, NODE_ID) == 0) {
           last_trigger_soil = soil_now;
 
-          digitalWrite(PIN_RELAY, pumpStatus);
+          // digitalWrite(PIN_RELAY, pumpStatus ? LOW : HIGH);
 
           bool success = true;
-          String errorCode = "";
+          String errorCode = "No";
           String message = "OK";
 
           float flow = default_flow;
           float amp  = default_amp;
 
-          if (action == "ON") {
-            mode = "CLD";
+          if (strcmp(action, "ON") == 0) {
+            strcpy(mode, "CLD");
             pumpStatus = true;
           }
-          else if (action == "OFF") {
-            mode = "CLD";
+          else if (strcmp(action, "OFF") == 0) {
+            strcpy(mode, "CLD");
             pumpStatus = false;
           }
-          else if (action == "AUTO") {
-            mode = "SEN";
+          else if (strcmp(action, "AUTO") == 0) {
+            strcpy(mode, "SEN");
           }
           else {
             success = false;
@@ -192,22 +219,28 @@ void loop() {
 
           unsigned long executedAt = millis();
 
-          String ack = "ACK," +
-                      NODE_ID + "," +
-                      cmd_id + "," +
-                      String(success ? "1" : "0") + "," +
-                      errorCode + "," +
-                      message + "," +
-                      (pumpStatus ? "ON" : "OFF") + "," +
-                      mode + "," +
-                      String(flow,1) + "," +
-                      String(amp,1) + "," +
-                      String(last_trigger_soil,1) + "," +
-                      String(executedAt);
+          char ack[128];
 
-          Serial.println("[LORA][TX ACK] " + ack);
+          snprintf(ack, sizeof(ack),
+          "ACK,%s,%s,%d,%s,%s,%s,%s,%.1f,%.1f,%.1f,%lu",
+          NODE_ID,
+          cmd_id,
+          success ? 1 : 0,
+          errorCode.c_str(),
+          message.c_str(),
+          pumpStatus ? "ON":"OFF",
+          mode,
+          flow,
+          amp,
+          last_trigger_soil,
+          executedAt
+          );
+
+          Serial.print("[LORA][TX ACK] ");
+          Serial.println(ack);
           sendUplink(ack);
           lastSend = millis();
+          delay(150);
 
           // cmdProcessing = true;
           // cmdLockUntil = millis() + CMD_LOCK_TIME;
@@ -228,7 +261,7 @@ void loop() {
   processSensors();
   cachedSoil = readSoil();
 
-  if (mode == "SEN") {
+  if (strcmp(mode, "SEN") == 0) {
     if (cachedSoil < 30 && !pumpStatus) {
       pumpStatus = true;
       last_trigger_soil = cachedSoil;
@@ -238,34 +271,39 @@ void loop() {
     }
   }
 
-  digitalWrite(PIN_RELAY, pumpStatus);
+  digitalWrite(PIN_RELAY, pumpStatus ? LOW : HIGH);
 
-  if (mode != "SEN" &&
+  if (strcmp(mode, "SEN") != 0 &&
       (
         (lastGatewaySeen == 0 && millis() - bootTime > HEARTBEAT_TIMEOUT) ||
         (lastGatewaySeen > 0 && millis() - lastGatewaySeen > HEARTBEAT_TIMEOUT)
       )
   ) {
-    mode = "SEN";
+    strcpy(mode, "SEN");
   }
 
   if (!cmdProcessing && millis() - lastSend > SEND_INTERVAL && loraReady) {
     lastSend = millis();
     unsigned long uptimeSec = (millis() - bootTime) / 1000;
-    String payload = NODE_ID + "," +
-                     String(ema_t, 1) + "," +
-                     String(ema_h, 1) + "," + 
-                     String(cachedSoil) + "," +
-                     String((int)ema_l) + "," +
-                     (pumpStatus ? "1" : "0") + "," +
-                     mode + "," +
-                     SECRET_KEY + "," +
-                     String(uptimeSec) + "," +
-                     String(default_amp, 1) + "," +
-                     String(default_flow, 1) + "," +
-                     String(last_trigger_soil, 1);
+    char payload[128];
+
+    snprintf(payload, sizeof(payload),
+    "%s,%.1f,%.1f,%d,%d,%d,%s,%lu,%.1f,%.1f,%.1f",
+    NODE_ID,
+    ema_t,
+    ema_h,
+    cachedSoil,
+    (int)ema_l,
+    pumpStatus ? 1 : 0,
+    mode,
+    uptimeSec,
+    default_amp,
+    default_flow,
+    last_trigger_soil
+    );
                      
-    Serial.println("[LORA][UPLINK] " + payload);
+    Serial.print("[LORA][UPLINK] ");
+    Serial.println(payload);
     sendUplink(payload);
   }
 }
