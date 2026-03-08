@@ -11,8 +11,13 @@
 #define PIN_RELAY      22
 
 const char NODE_ID[] = "NODE_01";
+const char NODE_SHORT[] = "01";
 
-const unsigned long SEND_INTERVAL = 5000;
+/* ================= INTERVAL CONFIG ================= */
+const unsigned long STATUS_INTERVAL = 5000;   // realtime
+const unsigned long SENSOR_INTERVAL = 20000;  // sensor
+/* =================================================== */
+
 const int LORA_RETRY_MAX = 5;
 
 const unsigned long HEARTBEAT_TIMEOUT = 60000;
@@ -30,51 +35,64 @@ float default_amp = 0.5;
 float default_flow = 1.2;
 float last_trigger_soil = 0;
 
-unsigned long lastSend = 0;
+unsigned long lastStatusSend = 0;
+unsigned long lastSensorSend = 0;
+unsigned long lastAckTime = 0;
+
 bool loraReady = false;
 
 int cachedSoil = 0;
 unsigned long bootTime = 0;
 
-/* ===== ADDED: COMMAND PRIORITY LOCK ===== */
+unsigned long lastSoilRead = 0;
+const unsigned long SOIL_INTERVAL = 2000;
+
+/* ===== COMMAND LOCK ===== */
 bool cmdProcessing = false;
 unsigned long cmdLockUntil = 0;
-const unsigned long CMD_LOCK_TIME = 2000;
-/* ========================================= */
+const unsigned long CMD_LOCK_TIME = 1500;
+/* ======================== */
 
 void initLoRa() {
+
   LoRa.setPins(PIN_LORA_SS, PIN_LORA_RST, PIN_LORA_DIO0);
 
   for (int i = 1; i <= LORA_RETRY_MAX; i++) {
+
     Serial.printf("[LORA] Đang thử kết nối lần %d/%d...\n", i, LORA_RETRY_MAX);
 
     if (LoRa.begin(433E6)) {
 
-      // ===== CẤU HÌNH RADIO (PHẢI GIỐNG GATEWAY) =====
+      /* ===== RADIO CONFIG ===== */
       LoRa.setSyncWord(0xA5);
-
       LoRa.setSpreadingFactor(9);
       LoRa.setSignalBandwidth(125E3);
       LoRa.setCodingRate4(5);
       LoRa.setTxPower(17);
       LoRa.setPreambleLength(8);
       LoRa.enableCrc();
+      /* ======================== */
 
       LoRa.receive();
 
       loraReady = true;
-      Serial.println("[LORA] Khởi tạo THÀNH CÔNG (Configured)");
+
+      Serial.println("[LORA] Khởi tạo THÀNH CÔNG");
+
       return;
     }
 
     delay(1000);
   }
 
-  Serial.println("[LORA][LỖI] Không tìm thấy module LoRa. Đang thử lại...");
+  Serial.println("[LORA][LỖI] Không tìm thấy module");
   loraReady = false;
 }
 
+/* ================= SENSOR PROCESS ================= */
+
 void processSensors() {
+
   float t = dht.readTemperature();
   float h = dht.readHumidity();
 
@@ -90,83 +108,125 @@ int readSoil() {
   long sum = 0;
 
   for (int i = 0; i < 10; i++) {
+
     int v = analogRead(PIN_SOIL);
 
     if (v < 100) v = 100;
     if (v > 4000) v = 4000;
 
     sum += v;
+
     delay(5);
   }
+
   int raw = sum / 10;
+
   int soil = map(raw, 4095, 1000, 0, 100);
+
   soil = constrain(soil, 0, 100);
+
   return soil;
 }
 
+/* ================= LORA SEND ================= */
+
 bool sendUplink(const char* data) {
+
   if (!loraReady) return false;
 
   LoRa.beginPacket();
-  LoRa.print(data);
-  LoRa.endPacket(true);   // wait TX done
 
-  delay(120);              // radio settle
+  LoRa.print(data);
+
+  LoRa.endPacket(true);
+
+  delay(random(50,120));
 
   LoRa.receive();
+  unsigned long start = millis();
+
+  while (millis() - start < 500)   // RX window
+  {
+      int packetSize = LoRa.parsePacket();
+
+      if (packetSize)
+      {
+          handleLoRaRx();
+          return true;
+      }
+  }
   return true;
 }
 
+/* ================= SETUP ================= */
+
 void setup() {
+
   Serial.begin(115200);
+
   Serial.println("\n[NODE] Đang khởi động...");
+
   dht.begin();
+
   pinMode(PIN_RELAY, OUTPUT);
+
   digitalWrite(PIN_RELAY, LOW);
-  Serial.println("[BOOT] Relay: TẮT | Chế độ: READY");
+
+  Serial.println("[BOOT] Relay: TẮT | READY");
+
   bootTime = millis();
+
   initLoRa();
 }
 
+/* ================= LOOP ================= */
+
 void loop() {
 
-  /* ===== ADDED: GLOBAL CMD LOCK CHECK ===== */
-  // if (cmdProcessing && millis() < cmdLockUntil) {
-  //   return;
-  // }
-  // cmdProcessing = false;
-  /* ======================================== */
+  /* ===== RX LORA ===== */
 
   if (loraReady) {
+
     int packetSize = LoRa.parsePacket();
+
     if (packetSize) {
+
       char msg[128];
       int i = 0;
 
       while (LoRa.available() && i < 127) {
+
         msg[i++] = (char)LoRa.read();
       }
 
       msg[i] = '\0';
 
-      Serial.print("[LORA][RX] Nhận lệnh: ");
+      Serial.print("[LORA][RX] ");
       Serial.println(msg);
 
+      /* ===== HEARTBEAT ===== */
+
       if (strncmp(msg, "HB", 2) == 0) {
+
         lastGatewaySeen = millis();
+
         Serial.println("[HB] RX");
       }
 
+      /* ===== CMD ===== */
+
       if (strncmp(msg,"CMD",3)==0) {
+
         if (cmdProcessing && millis() < cmdLockUntil) {
-          Serial.println("[CMD] Locked - ignore new CMD");
+
+          Serial.println("[CMD] Locked");
+
           return;
         }
 
         cmdProcessing = true;
-        cmdLockUntil = millis() + 1500;
 
-        lastGatewaySeen = millis();
+        cmdLockUntil = millis() + CMD_LOCK_TIME;
 
         int soil_now = readSoil();
 
@@ -176,6 +236,7 @@ void loop() {
         char* token = strtok(msg, ",");
 
         while (token && idx < 4) {
+
           v[idx++] = token;
           token = strtok(NULL, ",");
         }
@@ -187,31 +248,34 @@ void loop() {
         const char* action = v[3];
 
         if (strcmp(target, NODE_ID) == 0) {
+
           last_trigger_soil = soil_now;
 
-          // digitalWrite(PIN_RELAY, pumpStatus ? LOW : HIGH);
-
           bool success = true;
+
           String errorCode = "No";
           String message = "OK";
 
-          float flow = default_flow;
-          float amp  = default_amp;
-
           if (strcmp(action, "ON") == 0) {
+
             strcpy(mode, "CLD");
             pumpStatus = true;
-          }
-          else if (strcmp(action, "OFF") == 0) {
+
+          } else if (strcmp(action, "OFF") == 0) {
+
             strcpy(mode, "CLD");
             pumpStatus = false;
-          }
-          else if (strcmp(action, "AUTO") == 0) {
+
+          } else if (strcmp(action, "AUTO") == 0) {
+
             strcpy(mode, "SEN");
-          }
-          else {
+
+          } else {
+
             success = false;
+
             errorCode = "INVALID_CMD";
+
             message = "Unknown action";
           }
 
@@ -219,53 +283,62 @@ void loop() {
 
           unsigned long executedAt = millis();
 
+          /* ===== OPTIMIZED ACK ===== */
+          char modeShort;
+
+          if (strcmp(mode,"SEN")==0) modeShort='S';
+          else if (strcmp(mode,"CLD")==0) modeShort='C';
+          else modeShort='R';   // READY
+          int pumpShort  = pumpStatus ? 1 : 0;
+
+          int flowShort = (int)(default_flow * 10); // 1.2 -> 12
+          int ampShort  = (int)(default_amp * 10);  // 0.5 -> 5
+
           char ack[128];
 
-          snprintf(ack, sizeof(ack),
-          "ACK,%s,%s,%d,%s,%s,%s,%s,%.1f,%.1f,%.1f,%lu",
-          NODE_ID,
-          cmd_id,
+          snprintf(ack,sizeof(ack),
+          "A,%s,%s,%d,%s,%s,%d,%c,%d,%d,%d,%lu",
+          NODE_SHORT,            // NODE_01 -> 01
+          cmd_id,                // giữ nguyên
           success ? 1 : 0,
-          errorCode.c_str(),
-          message.c_str(),
-          pumpStatus ? "ON":"OFF",
-          mode,
-          flow,
-          amp,
-          last_trigger_soil,
+          errorCode.c_str(),     // giữ nguyên
+          message.c_str(),       // giữ nguyên
+          pumpShort,             // 1 / 0
+          modeShort,             // S / C
+          flowShort,             // flow * 10
+          ampShort,              // amp * 10
+          (int)last_trigger_soil,
           executedAt
           );
 
           Serial.print("[LORA][TX ACK] ");
           Serial.println(ack);
-          sendUplink(ack);
-          lastSend = millis();
-          delay(150);
 
-          // cmdProcessing = true;
-          // cmdLockUntil = millis() + CMD_LOCK_TIME;
+          sendUplink(ack);
+
+          lastAckTime = millis();   // wait before next send
+
+          lastStatusSend = millis();
+          lastSensorSend = millis();
 
           cmdProcessing = false;
-
         }
       }
     }
-  } else {
-    static unsigned long lastRetry = 0;
-    if (millis() - lastRetry > 10000) {
-      initLoRa();
-      lastRetry = millis();
-    }
+
   }
 
-  processSensors();
-  cachedSoil = readSoil();
+  /* ===== AUTO MODE ===== */
 
   if (strcmp(mode, "SEN") == 0) {
+
     if (cachedSoil < 30 && !pumpStatus) {
+
       pumpStatus = true;
       last_trigger_soil = cachedSoil;
+
     } else if (cachedSoil > 70 && pumpStatus) {
+
       pumpStatus = false;
       last_trigger_soil = cachedSoil;
     }
@@ -273,37 +346,67 @@ void loop() {
 
   digitalWrite(PIN_RELAY, pumpStatus ? LOW : HIGH);
 
-  if (strcmp(mode, "SEN") != 0 &&
-      (
-        (lastGatewaySeen == 0 && millis() - bootTime > HEARTBEAT_TIMEOUT) ||
-        (lastGatewaySeen > 0 && millis() - lastGatewaySeen > HEARTBEAT_TIMEOUT)
-      )
-  ) {
-    strcpy(mode, "SEN");
+  /* ===== REALTIME STATUS ===== */
+
+  if (!cmdProcessing &&
+      millis() - lastStatusSend > STATUS_INTERVAL &&
+      millis() - lastAckTime > STATUS_INTERVAL) {
+
+    lastStatusSend = millis();
+
+    unsigned long uptime = (millis() - bootTime)/1000;
+
+    char payload[80];
+
+    snprintf(payload,sizeof(payload),
+    "R,%s,%d,%s,%lu,%d,%d,%.0f",
+    NODE_SHORT,
+    pumpStatus ? 1:0,
+    mode,
+    uptime,
+    (int)(default_amp*10),
+    (int)(default_flow*10),
+    last_trigger_soil
+    );
+
+    Serial.print("[LORA][STATUS] ");
+    Serial.println(payload);
+
+    sendUplink(payload);
   }
 
-  if (!cmdProcessing && millis() - lastSend > SEND_INTERVAL && loraReady) {
-    lastSend = millis();
-    unsigned long uptimeSec = (millis() - bootTime) / 1000;
-    char payload[128];
+  /* ===== SENSOR DATA ===== */
 
-    snprintf(payload, sizeof(payload),
-    "%s,%.1f,%.1f,%d,%d,%d,%s,%lu,%.1f,%.1f,%.1f",
-    NODE_ID,
+  if (!cmdProcessing &&
+      millis() - lastSensorSend > SENSOR_INTERVAL &&
+      millis() - lastAckTime > SENSOR_INTERVAL) {
+
+    lastSensorSend = millis();
+
+    char payload[80];
+
+    snprintf(payload,sizeof(payload),
+    "S,%s,%.1f,%.1f,%d,%d",
+    NODE_SHORT,
     ema_t,
     ema_h,
     cachedSoil,
-    (int)ema_l,
-    pumpStatus ? 1 : 0,
-    mode,
-    uptimeSec,
-    default_amp,
-    default_flow,
-    last_trigger_soil
+    (int)ema_l
     );
-                     
-    Serial.print("[LORA][UPLINK] ");
+
+    Serial.print("[LORA][SENSOR] ");
     Serial.println(payload);
+
     sendUplink(payload);
+  }
+
+    /* ===== SENSOR UPDATE ===== */
+
+  processSensors();
+
+  if (millis() - lastSoilRead > SOIL_INTERVAL)
+  {
+    cachedSoil = readSoil();
+    lastSoilRead = millis();
   }
 }

@@ -12,7 +12,7 @@
 #define LORA_DIO0  26
 
 #define LORA_RETRY_MAX 5
-#define NODE_TIMEOUT 15000
+#define NODE_TIMEOUT 30000
 
 const char* WIFI_SSID = "Shindo";
 const char* WIFI_PASS = "vinh1230987";
@@ -185,7 +185,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
   }
 
   if (xQueueSend(cmdQueue, &item, pdMS_TO_TICKS(50)) != pdPASS) {
-    lastHeartbeatSent = millis();
+    // lastHeartbeatSent = millis();
     Serial.println("[CMD QUEUE] FULL - drop CMD");
   } else {
     Serial.println("[CMD QUEUE] Enqueued");
@@ -225,7 +225,7 @@ void cmdTask(void* p) {
         LoRa.print(loraCmd);
         LoRa.endPacket(true);
         LoRa.receive();
-
+        lastHeartbeatSent = millis();
         xSemaphoreGive(loraMutex);
       }
 
@@ -234,7 +234,6 @@ void cmdTask(void* p) {
       ackTimeout = millis() + 8000;
       strncpy(lastCmdId, item.cid, sizeof(lastCmdId));
 
-      lastHeartbeatSent = millis();
       Serial.print("[CMD→LORA] ");
       Serial.println(loraCmd);
     }
@@ -267,164 +266,244 @@ void core0Task(void* p) {
             Serial.println("[NTP] Sync fail");
         }
     }
+
     /* ======================================================
-     * P0 – LoRa RX (ƯU TIÊN CAO NHẤT)
+ * P0 – LoRa RX (ƯU TIÊN CAO NHẤT)
+ * ====================================================== */
+if (loraReady && xSemaphoreTake(loraMutex, pdMS_TO_TICKS(10))) {
+
+  int packetSize = LoRa.parsePacket();
+
+  if (packetSize) {
+
+    int rssi = LoRa.packetRssi();
+
+    Serial.printf("[LORA][RX RAW] RSSI=%d LEN=%d\n", rssi, packetSize);
+
+    char buf[256];
+    int i = 0;
+
+    while (LoRa.available() && i < 255) {
+      buf[i++] = (char)LoRa.read();
+    }
+
+    buf[i] = '\0';
+
+    xSemaphoreGive(loraMutex);
+
+    Serial.print("[LORA][DATA] ");
+    Serial.println(buf);
+
+    /* ======================================================
+     * SPLIT CSV
      * ====================================================== */
-    if (loraReady && xSemaphoreTake(loraMutex, pdMS_TO_TICKS(10))) {
 
-      int packetSize = LoRa.parsePacket();
-      if (packetSize) {
-        int rssi = LoRa.packetRssi();
-        Serial.printf("[LORA][RX RAW] RSSI=%d LEN=%d\n", rssi, packetSize);
+    char* v[16];
+    int idx = 0;
 
-        char buf[256];
-        int i = 0;
-        while (LoRa.available() && i < 255) {
-          buf[i++] = (char)LoRa.read();
-        }
-        buf[i] = '\0';
-        // String raw = buf;
+    char* token = strtok(buf, ",");
 
-        xSemaphoreGive(loraMutex);
+    while (token && idx < 16) {
+      v[idx++] = token;
+      token = strtok(NULL, ",");
+    }
 
-        /* ---------- ACK ---------- */
-        if (strncmp(buf, "ACK", 3) == 0) {
-          char* v[12];
-          // int idx = 0, start = 0;
-          int idx = 0;
-          char* token = strtok(buf, ",");
+    if (idx < 2) {
+      Serial.println("[LORA] malformed");
+      continue;
+    }
 
-          while (token != NULL && idx < 12) {
-              v[idx++] = token;
-              token = strtok(NULL, ",");
-          }
+    char type = v[0][0];
 
-          if (idx < 8) {
-            Serial.println("[ACK ERROR] malformed");
-            continue;
-          }
+    /* ======================================================
+     * PACKET TYPE A → ACK
+     * Node format:
+     * A,node,cmd_id,success,error_code,message,pump,mode,flow,amp,soil,time
+     * ====================================================== */
 
-          StaticJsonDocument<512> ack;
+    if (type == 'A') {
 
-          ack["type"]        = "ACK";
-          ack["node_id"]     = v[1];
-          ack["cmd_id"]      = v[2];
-          if (waitingAck) {
-              if (strcmp(v[2], lastCmdId) == 0) {
-                  waitingAck = false;
-                  Serial.println("[ACK MATCHED] OK");
-              } else {
-                  Serial.println("[ACK MISMATCH]");
-              }
-          }
-          ack["success"]     = (strcmp(v[3], "1") == 0);
-          ack["error_code"]  = v[4];
-          ack["message"]     = v[5];
-          ack["pump"]        = v[6];
-          ack["mode"]        = v[7];
-          ack["flow"] = (idx > 8) ? atof(v[8]) : 0;
-          ack["amp"] = (idx > 9) ? atof(v[9]) : 0;
-          ack["last_soil"] = (idx > 10) ? atof(v[10]) : 0;
-          ack["executed_at"] = (idx > 11) ? v[11] : "0";
-          ack["gateway_time"] = getTimeISO();
-          ack["rssi"]        = LoRa.packetRssi();
-          ack["gateway_id"]  = "ESP32_GATEWAY_01";
-
-          char out[512];
-          serializeJson(ack, out);
-
-          if (mqtt.connected()) {
-              bool ok = mqtt.publish("garden/control/ack", out);
-              Serial.println(ok ? "[MQTT][TX ACK] OK"
-                                : "[MQTT][TX ACK] FAIL");
-          } else {
-              Serial.println("[MQTT] Not connected - ACK dropped");
-          }
-
-          // Serial.println(ok ? "[MQTT][TX ACK] OK"
-          //                   : "[MQTT][TX ACK] FAIL");
-
-          continue;
-        }
-
-        /* ---------- SENSOR ---------- */
-        char* v[12];
-        // int idx = 0, start = 0;
-        int idx = 0;
-        char* token = strtok(buf, ",");
-
-        while (token != NULL && idx < 12) {
-            v[idx++] = token;
-            token = strtok(NULL, ",");
-        }
-
-        if (idx < 11) {
-          Serial.println("[ERROR] SENSOR malformed");
-          continue;
-        }
-
-        const char* node = v[0];
-        if (!isWhitelisted(node)) {
-          Serial.println("[SECURITY] SENSOR rejected (not in whitelist)");
-          continue;
-        }
-
-        bool existed = nodeRegistry.count(node);
-        bool wasOffline = existed && !nodeRegistry[node].online;
-
-        nodeRegistry[node].lastSeen = millis();
-        nodeRegistry[node].rssi = rssi;
-        nodeRegistry[node].online = true;
-
-        if (!existed || wasOffline) {
-          Serial.print("[NODE ONLINE] ");
-          Serial.println(node);
-        }
-
-        StaticJsonDocument<512> status;
-        status["type"] = "STATUS";
-        status["node_id"] = node;
-        status["pump"] = (strcmp(v[5], "1") == 0) ? "ON" : "OFF";
-        status["mode"] = v[6];
-        status["rssi"] = rssi;
-        status["uptime"] = atoi(v[7]);
-        status["amp"] = atof(v[8]);
-        status["flow"] = atof(v[9]);
-        status["last_soil"] = atof(v[10]);
-        status["current_status"] = "ONLINE";
-        String t = getTimeISO();
-        status["gateway_time"] = t.length() ? t : "1970-01-01T00:00:00";
-
-        char msg[512];
-        serializeJson(status, msg);
-        bool ok = mqtt.publish("garden/status", msg, false);
-        if (ok) {
-            Serial.print("[MQTT][TX STATUS] ");
-            Serial.println(msg);
-        } else {
-            Serial.println("[MQTT][TX STATUS] FAIL");
-        }
-
-        xSemaphoreTake(mutex, portMAX_DELAY);
-        String measuredAt = getTimeISO();
-        char line[128];
-
-        snprintf(line, sizeof(line),
-        "%s,%s,%s,%s,%s,%s",
-        v[0], v[1], v[2], v[3], v[4], measuredAt.c_str());
-
-        buffer[head] = line;
-        head = (head + 1) % MAX_BUF;
-        if (count < MAX_BUF) count++;
-        xSemaphoreGive(mutex);
-
-        Serial.printf("[BUFFER] Stored (%d/%d)\n", count, MAX_BUF);
-
-        continue; // RX xong → quay lại ngay
+      if (idx < 8) {
+        Serial.println("[ACK] malformed");
+        continue;
       }
 
-      xSemaphoreGive(loraMutex);
+      const char* nodeShort = v[1];
+      String nodeId = "NODE_" + String(nodeShort);
+
+      StaticJsonDocument<512> ack;
+
+      ack["type"] = "ACK";
+      ack["node_id"] = nodeId;
+      ack["cmd_id"] = v[2];
+
+      /* ===== ACK MATCH CHECK ===== */
+      if (waitingAck) {
+
+        if (strcmp(v[2], lastCmdId) == 0) {
+          waitingAck = false;
+          lastHeartbeatSent = millis();
+          Serial.println("[ACK MATCHED]");
+        } else {
+          Serial.println("[ACK CMD_ID MISMATCH]");
+        }
+
+      }
+
+      ack["success"] = (strcmp(v[3], "1") == 0);
+
+      /* ===== KHÔNG RÚT GỌN ===== */
+      ack["error_code"] = v[4];
+      ack["message"] = v[5];
+
+      /* ===== DECODE PUMP ===== */
+      ack["pump"] = (strcmp(v[6], "1") == 0) ? "ON" : "OFF";
+
+      /* ===== DECODE MODE ===== */
+      if (strcmp(v[7],"S")==0)
+          ack["mode"] = "SEN";
+      else if (strcmp(v[7],"C")==0)
+          ack["mode"] = "CLD";
+      else if (strcmp(v[7],"R")==0)
+          ack["mode"] = "READY";
+      else
+          ack["mode"] = "UNKNOWN";
+
+      /* ===== SCALE BACK ===== */
+
+      ack["flow"] = (idx > 8) ? atof(v[8]) / 10.0 : 0;
+      ack["amp"] = (idx > 9) ? atof(v[9]) / 10.0 : 0;
+      ack["last_soil"] = (idx > 10) ? atoi(v[10]) : 0;
+      ack["executed_at"] = (idx > 11) ? v[11] : "0";
+
+      ack["rssi"] = rssi;
+      ack["gateway_time"] = getTimeISO();
+      ack["gateway_id"] = "ESP32_GATEWAY_01";
+
+      char out[512];
+      serializeJson(ack, out);
+
+      if (mqtt.connected()) {
+
+        bool ok = mqtt.publish("garden/control/ack", out);
+
+        Serial.println(ok ? "[MQTT][TX ACK] OK"
+                          : "[MQTT][TX ACK] FAIL");
+      }
+
+      continue;
     }
+
+    /* ======================================================
+     * PACKET TYPE R → STATUS
+     * Node format:
+     * R,node,pump,mode,uptime,amp,flow,soil
+     * ====================================================== */
+
+    if (type == 'R') {
+
+      if (idx < 8) {
+        Serial.println("[STATUS] malformed");
+        continue;
+      }
+
+      String nodeId = "NODE_" + String(v[1]);
+
+      bool existed = nodeRegistry.count(nodeId);
+      bool wasOffline = existed && !nodeRegistry[nodeId].online;
+
+      nodeRegistry[nodeId].lastSeen = millis();
+      nodeRegistry[nodeId].rssi = rssi;
+      nodeRegistry[nodeId].online = true;
+
+      if (!existed || wasOffline) {
+        Serial.print("[NODE ONLINE] ");
+        Serial.println(nodeId);
+      }
+
+      StaticJsonDocument<512> status;
+
+      status["type"] = "STATUS";
+      status["node_id"] = nodeId;
+
+      status["pump"] = (strcmp(v[2], "1") == 0) ? "ON" : "OFF";
+      status["mode"] = v[3];
+
+      status["uptime"] = atoi(v[4]);
+
+      status["amp"] = atof(v[5]) / 10.0;
+      status["flow"] = atof(v[6]) / 10.0;
+
+      status["last_soil"] = atoi(v[7]);
+
+      status["rssi"] = rssi;
+      status["current_status"] = "ONLINE";
+
+      status["gateway_time"] = getTimeISO();
+
+      char msg[512];
+      serializeJson(status, msg);
+
+      bool ok = mqtt.publish("garden/status", msg);
+
+      if (ok) {
+        Serial.print("[MQTT][TX STATUS] ");
+        Serial.println(msg);
+      } else {
+        Serial.println("[MQTT][TX STATUS] FAIL");
+      }
+
+      continue;
+    }
+
+    /* ======================================================
+     * PACKET TYPE S → SENSOR
+     * Node format:
+     * S,node,temp,humi,soil,light
+     * ====================================================== */
+
+    if (type == 'S') {
+
+      if (idx < 6) {
+        Serial.println("[SENSOR] malformed");
+        continue;
+      }
+
+      String nodeId = "NODE_" + String(v[1]);
+
+      /* ===== PUSH SENSOR DATA INTO BUFFER ===== */
+
+      xSemaphoreTake(mutex, portMAX_DELAY);
+
+      String measuredAt = getTimeISO();
+
+      char line[128];
+
+      snprintf(line, sizeof(line),
+      "%s,%s,%s,%s,%s,%s",
+      nodeId.c_str(),
+      v[2],  // temp
+      v[3],  // humi
+      v[4],  // soil
+      v[5],  // light
+      measuredAt.c_str());
+
+      buffer[head] = line;
+
+      head = (head + 1) % MAX_BUF;
+
+      if (count < MAX_BUF) count++;
+
+      xSemaphoreGive(mutex);
+
+      Serial.printf("[BUFFER] SENSOR stored (%d/%d)\n", count, MAX_BUF);
+
+      continue;
+    }
+  }
+
+  xSemaphoreGive(loraMutex);
+}
 
     /* ======================================================
      * P1 – MQTT (CHỈ CHẠY KHI KHÔNG CÓ RX)
