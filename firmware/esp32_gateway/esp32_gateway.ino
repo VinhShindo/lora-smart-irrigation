@@ -172,9 +172,14 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
   }
 
   CmdItem item;
-  strncpy(item.node, doc["node_id"], sizeof(item.node));
-  strncpy(item.cmd,  doc["action"], sizeof(item.cmd));
-  strncpy(item.cid,  doc["cmd_id"], sizeof(item.cid));
+  strncpy(item.node, doc["node_id"], sizeof(item.node)-1);
+item.node[sizeof(item.node)-1] = '\0';
+
+strncpy(item.cmd, doc["action"], sizeof(item.cmd)-1);
+item.cmd[sizeof(item.cmd)-1] = '\0';
+
+strncpy(item.cid, doc["cmd_id"], sizeof(item.cid)-1);
+item.cid[sizeof(item.cid)-1] = '\0';
 
   Serial.printf("[MQTT][CMD DATA] node=%s cmd=%s cid=%s\n",
                 item.node, item.cmd, item.cid);
@@ -218,16 +223,38 @@ void cmdTask(void* p) {
 
       if (xSemaphoreTake(loraMutex, portMAX_DELAY)) {
 
-        LoRa.idle();
-        delay(2);
+  Serial.println("[CMD] Preempt radio");
 
-        LoRa.beginPacket();
-        LoRa.print(loraCmd);
-        LoRa.endPacket(true);
-        LoRa.receive();
-        lastHeartbeatSent = millis();
-        xSemaphoreGive(loraMutex);
-      }
+  /* STOP RX NGAY */
+  LoRa.idle();
+
+  delay(5);
+
+  /* CLEAR RX BUFFER */
+  while (LoRa.available()) LoRa.read();
+
+  /* CHANNEL BUSY CHECK */
+  delay(5);
+
+if (LoRa.parsePacket()) {
+    Serial.println("[CMD] Channel busy");
+    xSemaphoreGive(loraMutex);
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    continue;
+}
+
+  /* SEND CMD */
+  LoRa.beginPacket();
+  LoRa.print(loraCmd);
+  LoRa.endPacket(true);
+
+  /* BACK TO RX */
+  LoRa.receive();
+
+  lastHeartbeatSent = millis();
+
+  xSemaphoreGive(loraMutex);
+}
 
       // KÍCH HOẠT CHỜ ACK
       waitingAck = true;
@@ -342,6 +369,7 @@ if (loraReady && xSemaphoreTake(loraMutex, pdMS_TO_TICKS(10))) {
 
         if (strcmp(v[2], lastCmdId) == 0) {
           waitingAck = false;
+          ackTimeout = 0;
           lastHeartbeatSent = millis();
           Serial.println("[ACK MATCHED]");
         } else {

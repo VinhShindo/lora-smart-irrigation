@@ -47,6 +47,8 @@ unsigned long bootTime = 0;
 unsigned long lastSoilRead = 0;
 const unsigned long SOIL_INTERVAL = 2000;
 
+unsigned long txBlockedUntil = 0;
+
 /* ===== COMMAND LOCK ===== */
 bool cmdProcessing = false;
 unsigned long cmdLockUntil = 0;
@@ -134,27 +136,16 @@ bool sendUplink(const char* data) {
 
   if (!loraReady) return false;
 
+  LoRa.idle();
+
   LoRa.beginPacket();
-
   LoRa.print(data);
-
   LoRa.endPacket(true);
 
-  delay(random(50,120));
+  delay(random(80,200));
 
   LoRa.receive();
-  unsigned long start = millis();
 
-  while (millis() - start < 500)   // RX window
-  {
-      int packetSize = LoRa.parsePacket();
-
-      if (packetSize)
-      {
-          handleLoRaRx();
-          return true;
-      }
-  }
   return true;
 }
 
@@ -227,6 +218,7 @@ void loop() {
         cmdProcessing = true;
 
         cmdLockUntil = millis() + CMD_LOCK_TIME;
+        txBlockedUntil = millis() + 3000; 
 
         int soil_now = readSoil();
 
@@ -314,6 +306,7 @@ void loop() {
           Serial.print("[LORA][TX ACK] ");
           Serial.println(ack);
 
+          delay(80);
           sendUplink(ack);
 
           lastAckTime = millis();   // wait before next send
@@ -322,6 +315,7 @@ void loop() {
           lastSensorSend = millis();
 
           cmdProcessing = false;
+txBlockedUntil = millis() + 3000;
         }
       }
     }
@@ -349,7 +343,8 @@ void loop() {
   /* ===== REALTIME STATUS ===== */
 
   if (!cmdProcessing &&
-      millis() - lastStatusSend > STATUS_INTERVAL &&
+  millis() > txBlockedUntil &&
+      millis() - lastStatusSend > STATUS_INTERVAL + random(0,1000) &&
       millis() - lastAckTime > STATUS_INTERVAL) {
 
     lastStatusSend = millis();
@@ -378,6 +373,7 @@ void loop() {
   /* ===== SENSOR DATA ===== */
 
   if (!cmdProcessing &&
+  millis() > txBlockedUntil &&
       millis() - lastSensorSend > SENSOR_INTERVAL &&
       millis() - lastAckTime > SENSOR_INTERVAL) {
 
