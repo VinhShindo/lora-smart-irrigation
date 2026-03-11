@@ -2,58 +2,209 @@
 #include <SPI.h>
 #include <DHT.h>
 
-#define PIN_LORA_SS    5
-#define PIN_LORA_RST   14
+/* =========================================================
+   PIN CONFIG
+   ========================================================= */
+
+#define PIN_LORA_SS 5
+#define PIN_LORA_RST 14
 #define PIN_LORA_DIO0 26
-#define PIN_DHT        32
-#define PIN_SOIL       34
-#define PIN_LDR        35
-#define PIN_RELAY      22
 
-const char NODE_ID[] = "NODE_01";
-const char NODE_SHORT[] = "01";
+#define PIN_DHT 32
+#define PIN_SOIL 34
+#define PIN_LDR 35
+#define PIN_RELAY 22
 
-/* ================= INTERVAL CONFIG ================= */
-const unsigned long STATUS_INTERVAL = 5000;   // realtime
-const unsigned long SENSOR_INTERVAL = 20000;  // sensor
-/* =================================================== */
+
+/* =========================================================
+   NODE IDENTIFICATION
+   ========================================================= */
+
+const char NODE_ID[] = "NODE_02";
+const char NODE_SHORT[] = "02";
+
+
+/* =========================================================
+   INTERVAL CONFIG
+   ========================================================= */
+
+const unsigned long STATUS_INTERVAL = 5000;
+const unsigned long SENSOR_INTERVAL = 20000;
+
+const unsigned long HEARTBEAT_TIMEOUT = 60000;
+
+const unsigned long SOIL_INTERVAL = 2000;
+
+const unsigned long HELLO_INTERVAL = 10000;
+const unsigned long DISCOVERY_WINDOW = 30000;
+
+/* =========================================================
+   LORA CONFIG
+   ========================================================= */
 
 const int LORA_RETRY_MAX = 5;
 
-const unsigned long HEARTBEAT_TIMEOUT = 60000;
-unsigned long lastGatewaySeen = 0;
+
+/* =========================================================
+   COMMAND LOCK
+   ========================================================= */
+
+const unsigned long CMD_LOCK_TIME = 1500;
+
+
+/* =========================================================
+   MESH CONFIG
+   ========================================================= */
+
+#define MAX_MESH_NODE 5
+#define MAX_HOP 3
+
+struct MeshNode {
+
+  char id[4];
+  int rssi;
+  unsigned long lastSeen;
+};
+
+struct NodeMetric {
+
+  char id[4];
+  int gwRssi;
+  unsigned long lastUpdate;
+};
+
+
+/* =========================================================
+   GLOBAL STATE
+   ========================================================= */
 
 DHT dht(PIN_DHT, DHT11);
 
-float ema_t = 0, ema_h = 0, ema_l = 0;
-float alpha = 0.1;
-
+bool loraReady = false;
 bool pumpStatus = false;
+
 char mode[8] = "READY";
 
 float default_amp = 0.5;
 float default_flow = 1.2;
+
 float last_trigger_soil = 0;
+
+float ema_t = 0;
+float ema_h = 0;
+float ema_l = 0;
+
+float alpha = 0.1;
+
+unsigned long bootTime = 0;
 
 unsigned long lastStatusSend = 0;
 unsigned long lastSensorSend = 0;
 unsigned long lastAckTime = 0;
-
-bool loraReady = false;
-
-int cachedSoil = 0;
-unsigned long bootTime = 0;
-
 unsigned long lastSoilRead = 0;
-const unsigned long SOIL_INTERVAL = 2000;
 
 unsigned long txBlockedUntil = 0;
 
-/* ===== COMMAND LOCK ===== */
+unsigned long lastGatewaySeen = 0;
+
+#define PACKET_CACHE 20
+
+uint32_t packetCache[PACKET_CACHE];
+int packetIndex = 0;
+
+enum NodeState {
+  NODE_BOOT,
+  NODE_DISCOVERY,
+  NODE_NETWORK_READY
+};
+
+NodeState nodeState = NODE_BOOT;
+
+unsigned long discoveryStart = 0;
+unsigned long lastLeaderSeen = 0;
+
+const unsigned long LEADER_TIMEOUT = 30000;
+const unsigned long LEADER_HB_INTERVAL = 10000;
+
+unsigned long lastLeaderHB = 0;
+
+/* =========================================================
+   COMMAND PROCESS
+   ========================================================= */
+
 bool cmdProcessing = false;
 unsigned long cmdLockUntil = 0;
-const unsigned long CMD_LOCK_TIME = 1500;
-/* ======================== */
+
+
+/* =========================================================
+   SENSOR CACHE
+   ========================================================= */
+
+int cachedSoil = 0;
+
+struct SensorData {
+  float t;
+  float h;
+  int soil;
+  int light;
+};
+
+SensorData nodeCache[5];
+
+/* =========================================================
+   LEADER AGGREGATION CACHE
+   ========================================================= */
+
+#define LEADER_BUF 6
+#define LEADER_TRIGGER 3
+
+struct LeaderSensorPacket {
+  char node[8];
+  float t;
+  float h;
+  int soil;
+  int light;
+};
+
+struct LeaderStatusPacket {
+  char node[8];
+  int pump;
+  char mode[4];
+  int soil;
+};
+
+LeaderSensorPacket sensorBuf[LEADER_BUF];
+LeaderStatusPacket statusBuf[LEADER_BUF];
+
+int sensorCount = 0;
+int statusCount = 0;
+
+unsigned long lastLeaderFlush = 0;
+const unsigned long LEADER_FLUSH_INTERVAL = 10000;
+
+/* =========================================================
+   MESH STATE
+   ========================================================= */
+
+MeshNode meshTable[MAX_MESH_NODE];
+int meshCount = 0;
+
+NodeMetric nodeTable[5];
+int nodeCount = 0;
+
+char leaderId[4] = "";
+
+bool isLeader = false;
+bool leaderLocked = false;
+bool networkFormed = false;
+
+unsigned long lastHello = 0;
+unsigned long lastLeaderCheck = 0;
+
+
+/* =========================================================
+   LORA INIT
+   ========================================================= */
 
 void initLoRa() {
 
@@ -65,7 +216,6 @@ void initLoRa() {
 
     if (LoRa.begin(433E6)) {
 
-      /* ===== RADIO CONFIG ===== */
       LoRa.setSyncWord(0xA5);
       LoRa.setSpreadingFactor(9);
       LoRa.setSignalBandwidth(125E3);
@@ -73,7 +223,6 @@ void initLoRa() {
       LoRa.setTxPower(17);
       LoRa.setPreambleLength(8);
       LoRa.enableCrc();
-      /* ======================== */
 
       LoRa.receive();
 
@@ -88,10 +237,14 @@ void initLoRa() {
   }
 
   Serial.println("[LORA][LỖI] Không tìm thấy module");
+
   loraReady = false;
 }
 
-/* ================= SENSOR PROCESS ================= */
+
+/* =========================================================
+   SENSOR PROCESSING
+   ========================================================= */
 
 void processSensors() {
 
@@ -102,8 +255,10 @@ void processSensors() {
   if (!isnan(h)) ema_h = alpha * h + (1 - alpha) * ema_h;
 
   float l = map(analogRead(PIN_LDR), 0, 4095, 0, 100);
+
   ema_l = alpha * l + (1 - alpha) * ema_l;
 }
+
 
 int readSoil() {
 
@@ -130,7 +285,68 @@ int readSoil() {
   return soil;
 }
 
-/* ================= LORA SEND ================= */
+bool isRoutable(char t) {
+  return (t == 'D' || t == 'S' || t == 'A' || t == 'C');
+}
+
+void flushSensorBatch() {
+
+  if (sensorCount == 0) return;
+  delay(random(50, 150));
+  char packet[256];
+
+  int offset = 0;
+
+  offset += sprintf(packet, "BATCHSEN,");
+
+  for (int i = 0; i < sensorCount; i++) {
+
+    offset += sprintf(packet + offset,
+                      "D,%s,%.1f,%.1f,%d,%d;",
+                      sensorBuf[i].node,
+                      sensorBuf[i].t,
+                      sensorBuf[i].h,
+                      sensorBuf[i].soil,
+                      sensorBuf[i].light);
+  }
+
+  Serial.println("[LEADER] SENSOR BATCH -> GW");
+
+  sendUplink(packet);
+
+  sensorCount = 0;
+}
+
+void flushStatusBatch() {
+
+  if (statusCount == 0) return;
+  delay(random(50, 150));
+  char packet[256];
+
+  int offset = 0;
+
+  offset += sprintf(packet, "BATCHSTA,");
+
+  for (int i = 0; i < statusCount; i++) {
+
+    offset += sprintf(packet + offset,
+                      "S,%s,%d,%s,%d;",
+                      statusBuf[i].node,
+                      statusBuf[i].pump,
+                      statusBuf[i].mode,
+                      statusBuf[i].soil);
+  }
+
+  Serial.println("[LEADER] STATUS BATCH -> GW");
+
+  sendUplink(packet);
+
+  statusCount = 0;
+}
+
+/* =========================================================
+   LORA SEND
+   ========================================================= */
 
 bool sendUplink(const char* data) {
 
@@ -140,16 +356,252 @@ bool sendUplink(const char* data) {
 
   LoRa.beginPacket();
   LoRa.print(data);
-  LoRa.endPacket(true);
+  LoRa.endPacket();
 
-  delay(random(80,200));
+  delay(random(80, 200));
 
   LoRa.receive();
 
   return true;
 }
 
-/* ================= SETUP ================= */
+
+/* =========================================================
+   MESH FUNCTIONS
+   ========================================================= */
+
+void printMeshTable() {
+
+  Serial.println("------ MESH TABLE ------");
+
+  for (int i = 0; i < meshCount; i++) {
+
+    Serial.printf("Node: %s | RSSI: %d | LastSeen: %lu ms\n",
+                  meshTable[i].id,
+                  meshTable[i].rssi,
+                  millis() - meshTable[i].lastSeen);
+  }
+
+  Serial.println("------------------------");
+}
+
+
+void updateMesh(const char* node, int rssi) {
+  for (int i = 0; i < meshCount; i++) {
+    if (strcmp(meshTable[i].id, node) == 0) {
+      meshTable[i].rssi = rssi;
+      meshTable[i].lastSeen = millis();
+      return;
+    }
+  }
+  if (meshCount < MAX_MESH_NODE) {
+    strcpy(meshTable[meshCount].id, node);
+    meshTable[meshCount].rssi = rssi;
+    meshTable[meshCount].lastSeen = millis();
+    meshCount++;
+  }
+  Serial.printf("[MESH] discovered %s RSSI=%d\n", node, rssi);
+}
+
+void resetMeshNetwork() {
+  Serial.println("[MESH] Reset network state");
+
+  meshCount = 0;
+  nodeCount = 0;
+
+  leaderId[0] = '\0';
+  isLeader = false;
+  leaderLocked = false;
+  networkFormed = false;
+
+  lastLeaderSeen = millis();
+  lastGatewaySeen = millis();
+
+  sensorCount = 0;
+  statusCount = 0;
+
+  packetIndex = 0;
+  memset(packetCache, 0, sizeof(packetCache));
+
+  nodeState = NODE_DISCOVERY;
+  discoveryStart = millis();
+
+  Serial.println("[STATE] DISCOVERY MODE (rebuild mesh)");
+}
+
+/* =========================================================
+   MESH HELLO
+   ========================================================= */
+
+void sendHelloGW() {
+
+  char payload[32];
+
+  snprintf(payload, sizeof(payload),
+           "H,%s",
+           NODE_SHORT);
+
+  Serial.print("[DISCOVERY] HELLO->GW ");
+  Serial.println(payload);
+
+  sendUplink(payload);
+}
+
+void sendHelloMesh() {
+
+  char payload[32];
+
+  snprintf(payload, sizeof(payload),
+           "HM,%s",
+           NODE_SHORT);
+
+  Serial.print("[DISCOVERY] HELLO_MESH ");
+  Serial.println(payload);
+
+  sendUplink(payload);
+}
+
+/* =========================================================
+   METRIC TABLE
+   ========================================================= */
+
+void updateGatewayRSSI(const char* node, int rssi) {
+  for (int i = 0; i < nodeCount; i++) {
+    if (strcmp(nodeTable[i].id, node) == 0) {
+      nodeTable[i].gwRssi = rssi;
+      nodeTable[i].lastUpdate = millis();
+      return;
+    }
+  }
+  if (nodeCount < 5) {
+    strcpy(nodeTable[nodeCount].id, node);
+    nodeTable[nodeCount].gwRssi = rssi;
+    nodeTable[nodeCount].lastUpdate = millis();
+    nodeCount++;
+  }
+}
+
+
+void broadcastMetric() {
+
+  int myRssi = -120;
+
+  for (int i = 0; i < nodeCount; i++) {
+
+    if (strcmp(nodeTable[i].id, NODE_SHORT) == 0) {
+
+      myRssi = nodeTable[i].gwRssi;
+      break;
+    }
+  }
+
+  if (myRssi == -120) {
+    Serial.println("[METRIC] waiting GW RSSI");
+    return;
+  }
+
+  char payload[32];
+
+  snprintf(payload, sizeof(payload),
+           "M,%s,%d",
+           NODE_SHORT,
+           myRssi);
+
+  sendUplink(payload);
+}
+
+
+/* =========================================================
+   LEADER ELECTION
+   ========================================================= */
+
+void electLeader() {
+
+  if (leaderLocked) return;
+
+  if (networkFormed) return;
+
+  if (nodeCount <= 1) {
+
+    strcpy(leaderId, NODE_SHORT);
+
+    isLeader = true;
+    leaderLocked = true;
+    networkFormed = true;
+
+    nodeState = NODE_NETWORK_READY;
+    Serial.println("[STATE] NETWORK READY");
+
+    Serial.println("[LEADER] Single node mode");
+    Serial.println("[LEADER] I am leader");
+
+    return;
+  }
+
+  int best = -200;
+  char bestNode[4] = "";
+
+  for (int i = 0; i < nodeCount; i++) {
+
+    if (millis() - nodeTable[i].lastUpdate > 30000)
+      continue;
+
+    if (nodeTable[i].gwRssi > best || (nodeTable[i].gwRssi == best && strcmp(nodeTable[i].id, bestNode) < 0)) {
+
+      best = nodeTable[i].gwRssi;
+      strcpy(bestNode, nodeTable[i].id);
+      Serial.printf("[LEADER] candidate %s RSSI=%d\n",
+                    nodeTable[i].id,
+                    nodeTable[i].gwRssi);
+    }
+  }
+
+  if (strlen(bestNode) == 0) return;
+
+  strcpy(leaderId, bestNode);
+
+  isLeader = strcmp(leaderId, NODE_SHORT) == 0;
+
+  leaderLocked = true;
+  networkFormed = true;
+
+  nodeState = NODE_NETWORK_READY;
+
+  if (isLeader) {
+
+    char msg[32];
+
+    snprintf(msg, sizeof(msg), "L,%s", leaderId);
+
+    sendUplink(msg);
+
+    Serial.println("[LEADER] Broadcast leader");
+  }
+
+  Serial.print("[LEADER] Selected: ");
+  Serial.println(leaderId);
+
+  Serial.print("[LEADER] I am leader: ");
+  Serial.println(isLeader ? "YES" : "NO");
+}
+
+bool packetSeen(const char* p) {
+  uint32_t h = 0;
+  const char* temp = p;
+  while (*temp) {
+    h = (h * 33) ^ *temp++;
+  }
+  for (int i = 0; i < PACKET_CACHE; i++) {
+    if (packetCache[i] == h) return true;
+  }
+  packetCache[packetIndex++] = h;
+  if (packetIndex >= PACKET_CACHE) packetIndex = 0;
+  return false;
+}
+
+/* =========================================================
+   SETUP
+   ========================================================= */
 
 void setup() {
 
@@ -166,15 +618,30 @@ void setup() {
   Serial.println("[BOOT] Relay: TẮT | READY");
 
   bootTime = millis();
+  lastGatewaySeen = millis();
 
   initLoRa();
+
+  strcpy(meshTable[0].id, NODE_SHORT);
+  meshTable[0].rssi = 0;
+  meshTable[0].lastSeen = millis();
+  meshCount = 1;
+
+  nodeState = NODE_DISCOVERY;
+  discoveryStart = millis();
+
+  Serial.println("[STATE] DISCOVERY MODE");
+  Serial.println("[STATE] Waiting HELLO + RSSI metrics...");
 }
 
-/* ================= LOOP ================= */
+
+/* =========================================================
+   LOOP
+   ========================================================= */
 
 void loop() {
 
-  /* ===== RX LORA ===== */
+  /* ================= LORA RX ================= */
 
   if (loraReady) {
 
@@ -195,18 +662,66 @@ void loop() {
       Serial.print("[LORA][RX] ");
       Serial.println(msg);
 
-      /* ===== HEARTBEAT ===== */
+      if (packetSeen(msg)) {
+        Serial.println("[DROP] duplicate packet");
+        return;
+      }
 
-      if (strncmp(msg, "HB", 2) == 0) {
+      /* ===== HELLO RX ===== */
 
-        lastGatewaySeen = millis();
+      if (strncmp(msg, "HM,", 3) == 0) {
 
-        Serial.println("[HB] RX");
+        char node[4];
+
+        sscanf(msg, "HM,%3[^,]", node);
+
+        if (strcmp(node, NODE_SHORT) == 0)
+          return;
+
+        int rssi = LoRa.packetRssi();
+
+        updateMesh(node, rssi);
+
+        Serial.print("[MESH] Node discovered: ");
+        Serial.println(node);
+      }
+      /* ===== HR METRIC ===== */
+
+      if (msg[0] == 'R') {
+
+        char node[4];
+        int rssi;
+
+        sscanf(msg, "R,%3[^,],%d", node, &rssi);
+
+        if (strcmp(node, NODE_SHORT) != 0)
+          return;  // not for me
+
+        Serial.printf("[DISCOVERY] GW RSSI = %d\n", rssi);
+
+        updateGatewayRSSI(NODE_SHORT, rssi);
+      }
+
+      /* ===== MT METRIC ===== */
+
+      if (msg[0] == 'M') {
+
+        char node[4];
+        int rssi;
+
+        sscanf(msg, "M,%3[^,],%d", node, &rssi);
+
+        if (strcmp(node, NODE_SHORT) == 0)
+          return;  // ignore own metric
+
+        updateGatewayRSSI(node, rssi);
+
+        Serial.printf("[METRIC] Node %s gwRSSI=%d\n", node, rssi);
       }
 
       /* ===== CMD ===== */
 
-      if (strncmp(msg,"CMD",3)==0) {
+      if (msg[0] == 'C') {
 
         if (cmdProcessing && millis() < cmdLockUntil) {
 
@@ -218,16 +733,16 @@ void loop() {
         cmdProcessing = true;
 
         cmdLockUntil = millis() + CMD_LOCK_TIME;
-        txBlockedUntil = millis() + 3000; 
+        txBlockedUntil = millis() + 3000;
 
         int soil_now = readSoil();
 
-        char* v[4];
+        char* v[6];
         int idx = 0;
 
         char* token = strtok(msg, ",");
 
-        while (token && idx < 4) {
+        while (token && idx < 5) {
 
           v[idx++] = token;
           token = strtok(NULL, ",");
@@ -235,9 +750,9 @@ void loop() {
 
         if (idx < 4) return;
 
-        const char* target = v[1];
-        const char* cmd_id = v[2];
-        const char* action = v[3];
+        const char* target = v[2];
+        const char* cmd_id = v[3];
+        const char* action = v[4];
 
         if (strcmp(target, NODE_ID) == 0) {
 
@@ -275,33 +790,33 @@ void loop() {
 
           unsigned long executedAt = millis();
 
-          /* ===== OPTIMIZED ACK ===== */
           char modeShort;
 
-          if (strcmp(mode,"SEN")==0) modeShort='S';
-          else if (strcmp(mode,"CLD")==0) modeShort='C';
-          else modeShort='R';   // READY
-          int pumpShort  = pumpStatus ? 1 : 0;
+          if (strcmp(mode, "SEN") == 0) modeShort = 'S';
+          else if (strcmp(mode, "CLD") == 0) modeShort = 'C';
+          else modeShort = 'R';
 
-          int flowShort = (int)(default_flow * 10); // 1.2 -> 12
-          int ampShort  = (int)(default_amp * 10);  // 0.5 -> 5
+          int pumpShort = pumpStatus ? 1 : 0;
+
+          int flowShort = (int)(default_flow * 10);
+          int ampShort = (int)(default_amp * 10);
 
           char ack[128];
 
-          snprintf(ack,sizeof(ack),
-          "A,%s,%s,%d,%s,%s,%d,%c,%d,%d,%d,%lu",
-          NODE_SHORT,            // NODE_01 -> 01
-          cmd_id,                // giữ nguyên
-          success ? 1 : 0,
-          errorCode.c_str(),     // giữ nguyên
-          message.c_str(),       // giữ nguyên
-          pumpShort,             // 1 / 0
-          modeShort,             // S / C
-          flowShort,             // flow * 10
-          ampShort,              // amp * 10
-          (int)last_trigger_soil,
-          executedAt
-          );
+          snprintf(ack, sizeof(ack),
+                   "A,%s,GW,%d,%s,%d,%s,%s,%d,%c,%d,%d,%d,%lu",
+                   NODE_SHORT,
+                   MAX_HOP,
+                   cmd_id,
+                   success ? 1 : 0,
+                   errorCode.c_str(),
+                   message.c_str(),
+                   pumpShort,
+                   modeShort,
+                   flowShort,
+                   ampShort,
+                   (int)last_trigger_soil,
+                   executedAt);
 
           Serial.print("[LORA][TX ACK] ");
           Serial.println(ack);
@@ -309,20 +824,208 @@ void loop() {
           delay(80);
           sendUplink(ack);
 
-          lastAckTime = millis();   // wait before next send
+          lastAckTime = millis();
 
           lastStatusSend = millis();
           lastSensorSend = millis();
 
           cmdProcessing = false;
-txBlockedUntil = millis() + 3000;
+          txBlockedUntil = millis() + 3000;
+        }
+      }
+      /* ===== ROUTE FORWARD ===== */
+
+      if (isRoutable(msg[0])) {
+
+        char type;
+        char src[4];
+        char dest[4];
+        int hop;
+        char data[96];
+
+        if (sscanf(msg, "%c,%3[^,],%3[^,],%d,%95[^\n]",
+                   &type, src, dest, &hop, data)
+            < 4)
+          return;
+
+        if (hop <= 0) {
+          Serial.println("[DROP] hop=0");
+          return;
+        }
+
+        hop--;
+        if (hop == 0) {
+          Serial.println("[DROP] TTL expired");
+          return;
+        }
+        if (strcmp(dest, NODE_SHORT) == 0) {
+
+          Serial.println("[ROUTE] packet for me");
+
+          // process command or data
+          return;
+        }
+
+        if (strcmp(dest, "GW") == 0 && !isLeader && strlen(leaderId) > 0) {
+          if (strcmp(src, NODE_SHORT) == 0)
+            return;
+          Serial.println("[ROUTE] forward to leader");
+
+          char rest[96];
+
+          char* p = strchr(msg, ',');
+          p = strchr(p + 1, ',');
+          p = strchr(p + 1, ',');
+
+          strcpy(rest, p + 1);
+
+          char fwd[128];
+
+          snprintf(
+            fwd,
+            sizeof(fwd),
+            "%c,%s,%s,%d,%s",
+            type,
+            src,
+            dest,
+            hop,
+            rest);
+
+          sendUplink(fwd);
+          return;
+        }
+
+        if (isLeader) {
+
+          if (type == 'D') {
+
+            if (sensorCount < LEADER_BUF) {
+
+              sscanf(msg, "%*c,%3[^,],%*[^,],%*d,%f,%f,%d,%d",
+                     sensorBuf[sensorCount].node,
+                     &sensorBuf[sensorCount].t,
+                     &sensorBuf[sensorCount].h,
+                     &sensorBuf[sensorCount].soil,
+                     &sensorBuf[sensorCount].light);
+
+              sensorCount++;
+
+              Serial.printf("[LEADER] sensor cached (%d)\n", sensorCount);
+
+              if (sensorCount >= LEADER_TRIGGER) {
+                flushSensorBatch();
+              }
+            }
+
+            return;
+          }
+
+          if (type == 'S') {
+
+            if (statusCount < LEADER_BUF) {
+
+              sscanf(msg, "%*c,%3[^,],%*[^,],%*d,%d,%3[^,],%*d,%*d,%*d,%d",
+                     statusBuf[statusCount].node,
+                     &statusBuf[statusCount].pump,
+                     statusBuf[statusCount].mode,
+                     &statusBuf[statusCount].soil);
+
+              statusCount++;
+
+              Serial.printf("[LEADER] status cached (%d)\n", statusCount);
+
+              if (statusCount >= LEADER_TRIGGER) {
+                flushStatusBatch();
+              }
+            }
+
+            return;
+          }
+
+          sendUplink(msg);
+        }
+      }
+
+      if (strncmp(msg, "L,", 2) == 0) {
+
+        char leader[4];
+
+        sscanf(msg, "L,%3s", leader);
+
+        strcpy(leaderId, leader);
+
+        networkFormed = true;
+        leaderLocked = true;
+
+        isLeader = strcmp(leaderId, NODE_SHORT) == 0;
+
+        nodeState = NODE_NETWORK_READY;
+
+        Serial.print("[LEADER] network leader = ");
+        Serial.println(leaderId);
+      }
+      /* ===== HEARTBEAT ===== */
+
+      if (msg[0] == 'B') {
+        char target[8];
+
+        sscanf(msg, "B,%7s", target);
+
+        if (strcmp(target, "ALL") == 0 || strcmp(target, NODE_SHORT) == 0) {
+          lastGatewaySeen = millis();
+
+          Serial.println("[HB] Gateway alive");
+        }
+
+        if (isLeader) {
+          sendUplink(msg);  // forward heartbeat
+        }
+      }
+
+      if (strncmp(msg, "HL,", 3) == 0) {
+        char leader[4];
+
+        sscanf(msg, "HL,%3s", leader);
+
+        if (strcmp(leader, leaderId) == 0) {
+          lastLeaderSeen = millis();
+
+          Serial.println("[HB] Leader alive");
         }
       }
     }
-
   }
 
-  /* ===== AUTO MODE ===== */
+  if (isLeader && millis() - lastLeaderFlush > LEADER_FLUSH_INTERVAL) {
+
+    flushSensorBatch();
+    flushStatusBatch();
+
+    lastLeaderFlush = millis();
+  }
+
+  if (!isLeader && networkFormed) {
+    if (millis() - lastLeaderSeen > LEADER_TIMEOUT) {
+
+      Serial.println("[MESH] Leader lost -> rebuilding mesh");
+      resetMeshNetwork();
+
+      lastHello = 0;
+    }
+  }
+
+  for (int i = 0; i < meshCount; i++) {
+    if (millis() - meshTable[i].lastSeen > 30000) {
+      Serial.printf("[MESH] node %s timeout\n", meshTable[i].id);
+
+      for (int j = i; j < meshCount - 1; j++)
+        meshTable[j] = meshTable[j + 1];
+
+      meshCount--;
+    }
+  }
+
+  /* ================= AUTO MODE ================= */
 
   if (strcmp(mode, "SEN") == 0) {
 
@@ -338,71 +1041,184 @@ txBlockedUntil = millis() + 3000;
     }
   }
 
+  if (millis() - lastGatewaySeen > HEARTBEAT_TIMEOUT) {
+    Serial.println("[AUTO MODE] Gateway lost");
+
+    strcpy(mode, "SEN");
+  }
+
   digitalWrite(PIN_RELAY, pumpStatus ? LOW : HIGH);
 
-  /* ===== REALTIME STATUS ===== */
 
-  if (!cmdProcessing &&
-  millis() > txBlockedUntil &&
-      millis() - lastStatusSend > STATUS_INTERVAL + random(0,1000) &&
-      millis() - lastAckTime > STATUS_INTERVAL) {
+  /* ================= STATUS SEND ================= */
+
+  if (nodeState == NODE_NETWORK_READY && !cmdProcessing && millis() > txBlockedUntil && millis() - lastStatusSend > STATUS_INTERVAL + random(0, 1000) && millis() - lastAckTime > STATUS_INTERVAL) {
 
     lastStatusSend = millis();
 
-    unsigned long uptime = (millis() - bootTime)/1000;
+    unsigned long uptime = (millis() - bootTime) / 1000;
 
-    char payload[80];
+    if (isLeader) {
 
-    snprintf(payload,sizeof(payload),
-    "R,%s,%d,%s,%lu,%d,%d,%.0f",
-    NODE_SHORT,
-    pumpStatus ? 1:0,
-    mode,
-    uptime,
-    (int)(default_amp*10),
-    (int)(default_flow*10),
-    last_trigger_soil
-    );
+      if (statusCount < LEADER_BUF) {
 
-    Serial.print("[LORA][STATUS] ");
-    Serial.println(payload);
+        strcpy(statusBuf[statusCount].node, NODE_SHORT);
 
-    sendUplink(payload);
+        statusBuf[statusCount].pump = pumpStatus ? 1 : 0;
+
+        strcpy(statusBuf[statusCount].mode, mode);
+
+        statusBuf[statusCount].soil = cachedSoil;
+
+        statusCount++;
+
+        Serial.printf("[LEADER] self status cached (%d)\n", statusCount);
+
+        if (statusCount >= LEADER_TRIGGER) {
+          flushStatusBatch();
+        }
+      }
+
+    } else {
+      char payload[80];
+
+      snprintf(payload, sizeof(payload),
+               "S,%s,%s,%d,%d,%s,%lu,%d,%d,%.0f",
+               NODE_SHORT,
+               leaderId,
+               MAX_HOP,
+               pumpStatus ? 1 : 0,
+               mode,
+               uptime,
+               (int)(default_amp * 10),
+               (int)(default_flow * 10),
+               last_trigger_soil);
+
+      Serial.print("[LORA][STATUS] ");
+      Serial.println(payload);
+
+      sendUplink(payload);
+    }
   }
 
-  /* ===== SENSOR DATA ===== */
 
-  if (!cmdProcessing &&
-  millis() > txBlockedUntil &&
-      millis() - lastSensorSend > SENSOR_INTERVAL &&
-      millis() - lastAckTime > SENSOR_INTERVAL) {
+  /* ================= SENSOR SEND ================= */
+
+  if (nodeState == NODE_NETWORK_READY && !cmdProcessing && millis() > txBlockedUntil && millis() - lastSensorSend > SENSOR_INTERVAL + random(0, 3000) && millis() - lastAckTime > SENSOR_INTERVAL + random(0, 3000)) {
 
     lastSensorSend = millis();
 
-    char payload[80];
 
-    snprintf(payload,sizeof(payload),
-    "S,%s,%.1f,%.1f,%d,%d",
-    NODE_SHORT,
-    ema_t,
-    ema_h,
-    cachedSoil,
-    (int)ema_l
-    );
+    Serial.print("[ROUTE] Sensor route: ");
+    Serial.print(NODE_SHORT);
+    Serial.print(" -> ");
+    Serial.println((isLeader || strlen(leaderId) == 0) ? "GW" : leaderId);
 
-    Serial.print("[LORA][SENSOR] ");
-    Serial.println(payload);
+    const char* dest;
 
-    sendUplink(payload);
+    if (isLeader)
+      dest = "GW";
+    else if (strlen(leaderId) > 0)
+      dest = leaderId;
+    else
+      return;
+
+    if (isLeader) {
+
+      if (sensorCount < LEADER_BUF) {
+
+        strcpy(sensorBuf[sensorCount].node, NODE_SHORT);
+
+        sensorBuf[sensorCount].t = ema_t;
+        sensorBuf[sensorCount].h = ema_h;
+        sensorBuf[sensorCount].soil = cachedSoil;
+        sensorBuf[sensorCount].light = (int)ema_l;
+
+        sensorCount++;
+
+        Serial.printf("[LEADER] self sensor cached (%d)\n", sensorCount);
+
+        if (sensorCount >= LEADER_TRIGGER) {
+          flushSensorBatch();
+        }
+      }
+
+    } else {
+      char payload[80];
+
+      snprintf(payload, sizeof(payload),
+               "D,%s,%s,%d,%.1f,%.1f,%d,%d",
+               NODE_SHORT,
+               leaderId,
+               MAX_HOP,
+               ema_t,
+               ema_h,
+               cachedSoil,
+               (int)ema_l);
+
+      sendUplink(payload);
+    }
   }
 
-    /* ===== SENSOR UPDATE ===== */
+  /* ================= LEADER CHECK ================= */
+
+  // if (millis() - lastLeaderCheck > LEADER_CHECK_INTERVAL) {
+
+  //   lastLeaderCheck = millis();
+
+  //   electLeader();
+  // }
+
+  if (isLeader && networkFormed && millis() - lastLeaderHB > LEADER_HB_INTERVAL) {
+    char hb[16];
+
+    snprintf(hb, sizeof(hb), "HL,%s", NODE_SHORT);
+
+    sendUplink(hb);
+
+    Serial.println("[LEADER HB] sent");
+
+    lastLeaderHB = millis();
+  }
+
+  /* ================= SENSOR UPDATE ================= */
 
   processSensors();
 
-  if (millis() - lastSoilRead > SOIL_INTERVAL)
-  {
+  if (millis() - lastSoilRead > SOIL_INTERVAL) {
+
     cachedSoil = readSoil();
+
     lastSoilRead = millis();
+  }
+
+
+  /* ================= HELLO SEND ================= */
+
+  if (nodeState == NODE_DISCOVERY && millis() - lastHello > HELLO_INTERVAL + random(0, 1000)) {
+    lastHello = millis();
+
+    sendHelloGW();
+    delay(random(100, 300));
+
+    sendHelloMesh();
+    delay(random(100, 300));
+
+    broadcastMetric();
+
+    Serial.println("[METRIC TABLE]");
+
+    for (int i = 0; i < nodeCount; i++) {
+
+      Serial.printf("Node:%s GW_RSSI:%d Age:%lu\n",
+                    nodeTable[i].id,
+                    nodeTable[i].gwRssi,
+                    millis() - nodeTable[i].lastUpdate);
+    }
+  }
+
+  if (nodeState == NODE_DISCOVERY && millis() - discoveryStart > DISCOVERY_WINDOW) {
+    Serial.println("[DISCOVERY] Window closed -> elect leader");
+    electLeader();
   }
 }
