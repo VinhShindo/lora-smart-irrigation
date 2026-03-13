@@ -62,12 +62,6 @@ const int daylightOffset_sec = 0;
 bool ntpReady = false;
 
 /* =========================================================
-   MESH STATE
-   ========================================================= */
-String meshLeader = "";
-std::set<String> seenPackets;
-
-/* =========================================================
    NODE REGISTRY
    ========================================================= */
 struct NodeState {
@@ -413,386 +407,233 @@ void core0Task(void* p) {
 
       int packetSize = LoRa.parsePacket();
 
-      if (packetSize) {
-
-        int rssi = LoRa.packetRssi();
-
-        Serial.printf("[LORA][RX RAW] RSSI=%d LEN=%d\n", rssi, packetSize);
-
-        char buf[512];
-        int i = 0;
-
-        while (LoRa.available() && i < 511) {
-          buf[i++] = (char)LoRa.read();
-        }
-
-        buf[i] = '\0';
-
-        String hash = String(buf);
-
-        if (seenPackets.count(hash)) {
-          Serial.println("[DROP DUP]");
-          xSemaphoreGive(loraMutex);
-          continue;
-        }
-
-        seenPackets.insert(hash);
-
-        if (seenPackets.size() > 50) {
-          seenPackets.clear();
-        }
-
+      if (!packetSize) {
         xSemaphoreGive(loraMutex);
+        vTaskDelay(2);
+        continue;
+      }
 
-        Serial.print("[LORA][DATA] ");
-        Serial.println(buf);
+      int rssi = LoRa.packetRssi();
 
-        /* ======================================================
-                   CSV SPLIT
-                   ====================================================== */
+      char buf[256];
+      int i = 0;
+
+      while (LoRa.available() && i < sizeof(buf) - 1) {
+        buf[i++] = (char)LoRa.read();
+      }
+
+      buf[i] = '\0';
+
+      xSemaphoreGive(loraMutex);
+
+      if (i < 3) {
+        Serial.println("[LORA] short packet");
+        continue;
+      }
+
+      Serial.print("[LORA][RX] ");
+      Serial.println(buf);
+
+      /* ======================================================
+     HELLO
+     ====================================================== */
+
+      if (strncmp(buf, "H,", 2) == 0) {
+        char node[4];
+
+        if (sscanf(buf, "H,%3[^,\r\n]", node) == 1) {
+
+          Serial.printf("[HELLO] node=%s RSSI=%d\n", node, rssi);
+
+          char reply[32]; 
+
+          snprintf(reply, sizeof(reply), "R,%s,%d", node, rssi);
+
+          delay(100);
+          sendLoRa(reply);
+
+          Serial.print("[HELLO REPLY] ");
+          Serial.println(reply);
+        } else {
+          Serial.println("[HELLO] malformed");
+        }
+
+        continue;
+      }
+
+      /* ======================================================
+     BATCH SENSOR
+     BATCHSEN,D,01,28,70,500,800;D,02,...
+     ====================================================== */
+
+      if (strncmp(buf, "BATCHSEN,", 9) == 0) {
+
+        Serial.println("[GW] SENSOR BATCH RX");
+
+        char* record = buf + 9;
+        char* entry = strtok(record, ";");
+
+        while (entry) {
+
+          char node[4];
+          float t, h;
+          int soil, light;
+
+          if (sscanf(entry, "D,%3[^,],%f,%f,%d,%d",
+                     node, &t, &h, &soil, &light)
+              == 5) {
+
+            char nodeId[12];
+            snprintf(nodeId, sizeof(nodeId), "NODE_%s", node);
+
+
+            xSemaphoreTake(mutex, portMAX_DELAY);
+
+            String measuredAt = getTimeISO();
+
+            char line[128];
+
+            snprintf(line, sizeof(line),
+                     "%s,%.1f,%.1f,%d,%d,%s",
+                     nodeId,
+                     t, h, soil, light,
+                     measuredAt.c_str());
+
+            buffer[head] = line;
+
+            head = (head + 1) % MAX_BUF;
+
+            if (count < MAX_BUF) count++;
+
+            xSemaphoreGive(mutex);
+
+            Serial.printf("[BATCH SENSOR] %s stored (%d/%d)\n",
+                          node, count, MAX_BUF);
+          }
+
+          entry = strtok(NULL, ";");
+        }
+
+        continue;
+      }
+
+      /* ======================================================
+     BATCH STATUS
+     BATCHSTA,S,01,1,A,500;S,02,0,M,450
+     ====================================================== */
+
+      if (strncmp(buf, "BATCHSTA,", 9) == 0) {
+
+        Serial.println("[GW] STATUS BATCH RX");
+
+        char* record = buf + 9;
+        char* entry = strtok(record, ";");
+
+        while (entry) {
+
+          char node[4];
+          int pump;
+          char mode[4];
+          int soil;
+
+          if (sscanf(entry,
+                     "S,%3[^,],%d,%3[^,],%d",
+                     node, &pump, mode, &soil)
+              == 4) {
+
+            char nodeId[12];
+            snprintf(nodeId, sizeof(nodeId), "NODE_%s", node);
+
+
+            StaticJsonDocument<256> status;
+
+            status["type"] = "STATUS";
+            status["node_id"] = nodeId;
+            status["pump"] = pump ? "ON" : "OFF";
+            status["mode"] = mode;
+            status["last_soil"] = soil;
+            status["rssi"] = rssi;
+            status["current_status"] = "ONLINE";
+            status["gateway_time"] = getTimeISO();
+
+            char msg[256];
+            serializeJson(status, msg);
+
+            mqtt.publish("garden/status", msg);
+
+            Serial.printf("[BATCH STATUS] %s\n", node);
+          }
+
+          entry = strtok(NULL, ";");
+        }
+
+        continue;
+      }
+
+      /* ======================================================
+     ACK
+     A,02,GW,03,CMD123,1,OK,...
+     ====================================================== */
+
+      if (strncmp(buf, "A,", 2) == 0) {
 
         char* v[16];
         int idx = 0;
 
-        char* token = strtok(buf, ",");
+        char tmp[256];
+        strncpy(tmp, buf, sizeof(tmp));
+
+        char* token = strtok(tmp, ",");
 
         while (token && idx < 16) {
           v[idx++] = token;
           token = strtok(NULL, ",");
         }
 
-        if (idx < 2) {
-          Serial.println("[LORA] malformed");
+        if (idx < 6) {
+          Serial.println("[ACK] malformed");
           continue;
         }
 
-        char type = v[0][0];
+        char nodeId[12];
+        snprintf(nodeId, sizeof(nodeId), "NODE_%s", v[1]);
 
-        /* ======================================================
-          BATCH SENSOR
-        ====================================================== */
+        StaticJsonDocument<512> ack;
 
-        if (strncmp(buf, "BATCHSEN,", 9) == 0) {
+        ack["type"] = "ACK";
+        ack["node_id"] = nodeId;
+        ack["cmd_id"] = v[4];
 
-          Serial.println("[GW] SENSOR BATCH RX");
+        if (waitingAck && strcmp(v[4], lastCmdId) == 0) {
 
-          char* record = buf + 9;
+          waitingAck = false;
+          ackTimeout = 0;
 
-          char* entry = strtok(record, ";");
-
-          while (entry) {
-
-            char node[4];
-            float t, h;
-            int soil, light;
-
-            if (sscanf(entry, "D,%3[^,],%f,%f,%d,%d",
-                       node, &t, &h, &soil, &light)
-                == 5) {
-
-              String nodeId = "NODE_" + String(node);
-
-              xSemaphoreTake(mutex, portMAX_DELAY);
-
-              String measuredAt = getTimeISO();
-
-              char line[128];
-
-              snprintf(line, sizeof(line),
-                       "%s,%.1f,%.1f,%d,%d,%s",
-                       nodeId.c_str(),
-                       t, h, soil, light,
-                       measuredAt.c_str());
-
-              buffer[head] = line;
-
-              head = (head + 1) % MAX_BUF;
-
-              if (count < MAX_BUF) count++;
-
-              xSemaphoreGive(mutex);
-
-              Serial.printf("[BATCH SENSOR] %s stored\n", node);
-            }
-
-            entry = strtok(NULL, ";");
-          }
-
-          continue;
+          Serial.println("[ACK MATCHED]");
         }
 
-        /* ======================================================
-            BATCH STATUS
-          ====================================================== */
+        ack["success"] = (strcmp(v[5], "1") == 0);
+        ack["gateway_time"] = getTimeISO();
+        ack["rssi"] = rssi;
 
-        if (strncmp(buf, "BATCHSTA,", 9) == 0) {
+        char out[256];
 
-          Serial.println("[GW] STATUS BATCH RX");
+        serializeJson(ack, out);
 
-          char* record = buf + 9;
-
-          char* entry = strtok(record, ";");
-
-          while (entry) {
-
-            char node[4];
-            int pump;
-            char mode[4];
-            int soil;
-
-            if (sscanf(entry,
-                       "S,%3[^,],%d,%3[^,],%d",
-                       node, &pump, mode, &soil)
-                == 4) {
-
-              String nodeId = "NODE_" + String(node);
-
-              StaticJsonDocument<256> status;
-
-              status["type"] = "STATUS";
-              status["node_id"] = nodeId;
-              status["pump"] = pump ? "ON" : "OFF";
-              status["mode"] = mode;
-              status["last_soil"] = soil;
-              status["rssi"] = 0;
-              status["current_status"] = "ONLINE";
-              status["gateway_time"] = getTimeISO();
-
-              char msg[256];
-              serializeJson(status, msg);
-
-              mqtt.publish("garden/status", msg);
-            }
-
-            entry = strtok(NULL, ";");
-          }
-
-          continue;
+        if (mqtt.connected()) {
+          mqtt.publish("garden/control/ack", out);
         }
 
-        /* ======================================================
-                   HELLO
-                   ====================================================== */
+        Serial.println("[ACK RX]");
 
-        if (type == 'H') {
-
-          char node[4];
-          int rssi = LoRa.packetRssi();
-
-          if (sscanf(buf, "H,%3s", node) == 1) {
-            Serial.printf("[HELLO] from node=%s RSSI=%d\n", node, rssi);
-
-            char reply[32];
-            snprintf(reply, sizeof(reply), "R,%s,%d", node, rssi);
-
-            Serial.print("[HELLO REPLY] ");
-            Serial.println(reply);
-            sendLoRa(reply);
-          } else {
-            Serial.println("[HELLO] malformed");
-          }
-        }
-
-        /* ======================================================
-                   ACK
-                   ====================================================== */
-
-        if (type == 'A') {
-
-          if (idx < 12) {
-            Serial.println("[ACK] malformed");
-            continue;
-          }
-
-          const char* nodeShort = v[1];
-
-          String nodeId = "NODE_" + String(nodeShort);
-
-          StaticJsonDocument<512> ack;
-
-          ack["type"] = "ACK";
-          ack["node_id"] = nodeId;
-          ack["cmd_id"] = v[4];
-
-          if (waitingAck) {
-
-            if (strcmp(v[4], lastCmdId) == 0) {
-
-              waitingAck = false;
-              ackTimeout = 0;
-              lastHeartbeatSent = millis();
-
-              Serial.println("[ACK MATCHED]");
-
-            } else {
-
-              Serial.println("[ACK CMD_ID MISMATCH]");
-            }
-          }
-
-          ack["success"] = (strcmp(v[5], "1") == 0);
-
-          ack["error_code"] = v[6];
-          ack["message"] = v[7];
-
-          ack["pump"] = (strcmp(v[8], "1") == 0) ? "ON" : "OFF";
-
-          if (strcmp(v[9], "S") == 0)
-            ack["mode"] = "SEN";
-          else if (strcmp(v[9], "C") == 0)
-            ack["mode"] = "CLD";
-          else if (strcmp(v[9], "R") == 0)
-            ack["mode"] = "READY";
-          else
-            ack["mode"] = "UNKNOWN";
-
-          ack["flow"] = (idx > 10) ? atof(v[10]) / 10.0 : 0;
-          ack["amp"] = (idx > 11) ? atof(v[11]) / 10.0 : 0;
-          ack["last_soil"] = (idx > 12) ? atoi(v[12]) : 0;
-          ack["executed_at"] = (idx > 13) ? v[13] : "0";
-
-          ack["rssi"] = rssi;
-          ack["gateway_time"] = getTimeISO();
-          ack["gateway_id"] = "ESP32_GATEWAY_01";
-
-          char out[512];
-
-          serializeJson(ack, out);
-
-          if (mqtt.connected()) {
-
-            bool ok = mqtt.publish("garden/control/ack", out);
-
-            Serial.println(ok ? "[MQTT][TX ACK] OK"
-                              : "[MQTT][TX ACK] FAIL");
-          }
-
-          continue;
-        }
-        if (type == 'M') {
-
-          char node[4];
-          int rssi;
-
-          sscanf(v[1], "%3s", node);
-          rssi = atoi(v[2]);
-
-          Serial.printf("[MESH METRIC] node=%s rssi=%d\n", node, rssi);
-
-          continue;
-        }
-        /* ======================================================
-                   STATUS
-                   ====================================================== */
-
-        if (type == 'S') {
-
-          if (idx < 8) {
-            Serial.println("[STATUS] malformed");
-            continue;
-          }
-
-          String nodeId = "NODE_" + String(v[1]);
-
-          bool existed = nodeRegistry.count(nodeId);
-          bool wasOffline = existed && !nodeRegistry[nodeId].online;
-
-          nodeRegistry[nodeId].lastSeen = millis();
-          nodeRegistry[nodeId].rssi = rssi;
-          nodeRegistry[nodeId].online = true;
-
-          if (!existed || wasOffline) {
-
-            Serial.print("[NODE ONLINE] ");
-            Serial.println(nodeId);
-          }
-
-          StaticJsonDocument<512> status;
-
-          status["type"] = "STATUS";
-          status["node_id"] = nodeId;
-
-          status["pump"] = (strcmp(v[2], "1") == 0) ? "ON" : "OFF";
-          status["mode"] = v[3];
-
-          status["uptime"] = atoi(v[4]);
-
-          status["amp"] = atof(v[5]) / 10.0;
-          status["flow"] = atof(v[6]) / 10.0;
-
-          status["last_soil"] = atoi(v[7]);
-
-          status["rssi"] = rssi;
-          status["current_status"] = "ONLINE";
-
-          status["gateway_time"] = getTimeISO();
-
-          char msg[512];
-
-          serializeJson(status, msg);
-
-          bool ok = mqtt.publish("garden/status", msg);
-
-          if (ok) {
-
-            Serial.print("[MQTT][TX STATUS] ");
-            Serial.println(msg);
-
-          } else {
-
-            Serial.println("[MQTT][TX STATUS] FAIL");
-          }
-
-          continue;
-        }
-
-        /* ======================================================
-                   SENSOR
-                   ====================================================== */
-
-        if (type == 'D') {
-
-          if (idx < 8) {
-            Serial.println("[SENSOR] malformed");
-            continue;
-          }
-
-          String nodeId = "NODE_" + String(v[1]);
-
-          Serial.printf("[GW SENSOR] from %s via mesh\n", v[1]);
-
-          xSemaphoreTake(mutex, portMAX_DELAY);
-
-          String measuredAt = getTimeISO();
-
-          char line[128];
-
-          snprintf(
-            line,
-            sizeof(line),
-            "%s,%s,%s,%s,%s,%s",
-            nodeId.c_str(),
-            v[4],
-            v[5],
-            v[6],
-            v[7],
-            measuredAt.c_str());
-
-          buffer[head] = line;
-
-          head = (head + 1) % MAX_BUF;
-
-          if (count < MAX_BUF) count++;
-
-          xSemaphoreGive(mutex);
-
-          Serial.printf("[BUFFER] SENSOR stored (%d/%d)\n", count, MAX_BUF);
-
-          continue;
-        }
+        continue;
       }
 
-      xSemaphoreGive(loraMutex);
+      /* ======================================================
+     UNKNOWN PACKET
+     ====================================================== */
+
+      Serial.println("[LORA] UNKNOWN PACKET");
     }
 
     wifiReconnect();
@@ -803,7 +644,7 @@ void core0Task(void* p) {
            HEARTBEAT
            ====================================================== */
 
-    if (loraReady && !waitingAck && millis() - lastHeartbeatSent > HEARTBEAT_INTERVAL && xSemaphoreTake(loraMutex, 0)) {
+    if (loraReady && millis() - lastHeartbeatSent > HEARTBEAT_INTERVAL && xSemaphoreTake(loraMutex, 0)) {
 
       LoRa.idle();
       delay(2);
@@ -844,7 +685,7 @@ void core0Task(void* p) {
       waitingAck = false;
     }
 
-    vTaskDelay(1 / portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
@@ -991,7 +832,9 @@ void setup() {
     esp_restart();
   }
 
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS, 0, NULL, true);
 
   Serial.print("[WIFI] Connecting");
 

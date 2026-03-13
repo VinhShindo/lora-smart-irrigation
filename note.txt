@@ -1,0 +1,34 @@
+[DISCOVERY] HELLO->GW H,01
+[LORA][RX] R,01,-55
+[METRIC][GW] node=01 rssi=-55
+[DISCOVERY] GW RSSI received
+[DISCOVERY] HELLO_MESH HM,01
+[DISCOVERY] HELLO_MESH broadcast
+------ MESH TABLE ------
+------------------------
+[DISCOVERY] no mesh found
+[METRIC][TX] M,01,-55
+----- METRIC TABLE -----
+Node=01 gwRSSI=-55 age=433
+------------------------
+[DISCOVERY] Mesh detected -> JOIN
+[LORA][RX] B,ALL
+[HB] Gateway alive
+[DISCOVERY] Mesh detected -> JOIN
+[LORA][RX] JR,02
+[JOIN] connected to leader 02
+[LORA][STATUS] S,01,02,3,0,READY,18,5,12,0
+[ROUTE] Sensor route: 01 -> 02
+[LORA][RX] HL,02SEN,D,02,29.3,46.6,3,0;BATCHSTA,S,02,0,READ,3;S,02,0,READ,3;Xl{�
+[HB] malformed
+[ROUTE] malformed
+[LORA] Unknown packet
+[LORA][STATUS] S,01,02,3,0,READY,24,5,12,0
+[LORA][STATUS] S,01,02,3,0,READY,29,5,12,0
+[LORA][RX] BATCHSTA,S,02,0,READ,3;S,02,0,READ,3;
+[DROP] duplicate packet
+[DROP] duplicate packet
+[LORA] Unknown packet
+[LORA][RX] HL,02
+[HB] Leader alive
+[LORA][STATUS] S,01,02,3,0,READY,34,5,12,0

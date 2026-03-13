@@ -35,7 +35,7 @@ const unsigned long HEARTBEAT_TIMEOUT = 60000;
 
 const unsigned long SOIL_INTERVAL = 2000;
 
-const unsigned long HELLO_INTERVAL = 10000;
+const unsigned long HELLO_INTERVAL = 7000;
 const unsigned long DISCOVERY_WINDOW = 30000;
 
 /* =========================================================
@@ -107,7 +107,7 @@ unsigned long txBlockedUntil = 0;
 
 unsigned long lastGatewaySeen = 0;
 
-#define PACKET_CACHE 20
+#define PACKET_CACHE 32
 
 uint32_t packetCache[PACKET_CACHE];
 int packetIndex = 0;
@@ -128,6 +128,21 @@ const unsigned long LEADER_HB_INTERVAL = 10000;
 
 unsigned long lastLeaderHB = 0;
 
+enum DiscoveryState {
+  DISC_HELLO_GW,
+  DISC_WAIT_R,
+  DISC_HELLO_MESH,
+  DISC_SEND_METRIC,
+  DISC_DONE
+};
+
+DiscoveryState discState = DISC_HELLO_GW;
+unsigned long helloSentTime = 0;
+
+bool joinSent = false;
+bool joinScheduled = false;
+unsigned long joinTime = 0;
+
 /* =========================================================
    COMMAND PROCESS
    ========================================================= */
@@ -141,15 +156,6 @@ unsigned long cmdLockUntil = 0;
    ========================================================= */
 
 int cachedSoil = 0;
-
-struct SensorData {
-  float t;
-  float h;
-  int soil;
-  int light;
-};
-
-SensorData nodeCache[5];
 
 /* =========================================================
    LEADER AGGREGATION CACHE
@@ -199,8 +205,7 @@ bool leaderLocked = false;
 bool networkFormed = false;
 
 unsigned long lastHello = 0;
-unsigned long lastLeaderCheck = 0;
-
+unsigned long lastJoinAttempt = 0;
 
 /* =========================================================
    LORA INIT
@@ -292,7 +297,7 @@ bool isRoutable(char t) {
 void flushSensorBatch() {
 
   if (sensorCount == 0) return;
-  delay(random(50, 150));
+  delay(random(10, 40));
   char packet[256];
 
   int offset = 0;
@@ -320,7 +325,7 @@ void flushSensorBatch() {
 void flushStatusBatch() {
 
   if (statusCount == 0) return;
-  delay(random(50, 150));
+  delay(random(10, 40));
   char packet[256];
 
   int offset = 0;
@@ -357,9 +362,6 @@ bool sendUplink(const char* data) {
   LoRa.beginPacket();
   LoRa.print(data);
   LoRa.endPacket();
-
-  delay(random(80, 200));
-
   LoRa.receive();
 
   return true;
@@ -385,6 +387,45 @@ void printMeshTable() {
   Serial.println("------------------------");
 }
 
+void printMetricTable() {
+  Serial.println("----- METRIC TABLE -----");
+
+  for (int i = 0; i < nodeCount; i++) {
+    Serial.printf("Node=%s gwRSSI=%d age=%lu\n",
+                  nodeTable[i].id,
+                  nodeTable[i].gwRssi,
+                  millis() - nodeTable[i].lastUpdate);
+  }
+
+  Serial.println("------------------------");
+}
+
+void updateLastSeen(const char* node) {
+  if (strcmp(node, "GW") == 0) return;
+  if (strcmp(node, NODE_SHORT) == 0) return;
+
+  for (int i = 0; i < meshCount; i++) {
+
+    if (strcmp(meshTable[i].id, node) == 0) {
+
+      meshTable[i].lastSeen = millis();
+      return;
+    }
+  }
+
+  /* nếu chưa có -> thêm */
+
+  if (meshCount < MAX_MESH_NODE) {
+
+    strcpy(meshTable[meshCount].id, node);
+    meshTable[meshCount].rssi = -120;
+    meshTable[meshCount].lastSeen = millis();
+
+    meshCount++;
+
+    Serial.printf("[MESH] node dynamically added: %s\n", node);
+  }
+}
 
 void updateMesh(const char* node, int rssi) {
   for (int i = 0; i < meshCount; i++) {
@@ -401,6 +442,7 @@ void updateMesh(const char* node, int rssi) {
     meshCount++;
   }
   Serial.printf("[MESH] discovered %s RSSI=%d\n", node, rssi);
+  printMeshTable();
 }
 
 void resetMeshNetwork() {
@@ -419,11 +461,15 @@ void resetMeshNetwork() {
 
   sensorCount = 0;
   statusCount = 0;
+  joinSent = false;
+  joinScheduled = false;
 
   packetIndex = 0;
   memset(packetCache, 0, sizeof(packetCache));
 
   nodeState = NODE_DISCOVERY;
+  discState = DISC_HELLO_GW;
+  lastHello = 0;
   discoveryStart = millis();
 
   Serial.println("[STATE] DISCOVERY MODE (rebuild mesh)");
@@ -479,6 +525,7 @@ void updateGatewayRSSI(const char* node, int rssi) {
     nodeTable[nodeCount].lastUpdate = millis();
     nodeCount++;
   }
+  printMetricTable();
 }
 
 
@@ -496,7 +543,9 @@ void broadcastMetric() {
   }
 
   if (myRssi == -120) {
-    Serial.println("[METRIC] waiting GW RSSI");
+
+    Serial.println("[METRIC] cannot broadcast metric (no GW RSSI)");
+
     return;
   }
 
@@ -506,6 +555,9 @@ void broadcastMetric() {
            "M,%s,%d",
            NODE_SHORT,
            myRssi);
+
+  Serial.print("[METRIC][TX] ");
+  Serial.println(payload);
 
   sendUplink(payload);
 }
@@ -528,6 +580,7 @@ void electLeader() {
     isLeader = true;
     leaderLocked = true;
     networkFormed = true;
+    lastLeaderSeen = millis();
 
     nodeState = NODE_NETWORK_READY;
     Serial.println("[STATE] NETWORK READY");
@@ -622,11 +675,6 @@ void setup() {
 
   initLoRa();
 
-  strcpy(meshTable[0].id, NODE_SHORT);
-  meshTable[0].rssi = 0;
-  meshTable[0].lastSeen = millis();
-  meshCount = 1;
-
   nodeState = NODE_DISCOVERY;
   discoveryStart = millis();
 
@@ -642,7 +690,6 @@ void setup() {
 void loop() {
 
   /* ================= LORA RX ================= */
-
   if (loraReady) {
 
     int packetSize = LoRa.parsePacket();
@@ -653,7 +700,6 @@ void loop() {
       int i = 0;
 
       while (LoRa.available() && i < 127) {
-
         msg[i++] = (char)LoRa.read();
       }
 
@@ -662,336 +708,542 @@ void loop() {
       Serial.print("[LORA][RX] ");
       Serial.println(msg);
 
-      if (packetSeen(msg)) {
-        Serial.println("[DROP] duplicate packet");
-        return;
-      }
+      char* start = msg;
 
-      /* ===== HELLO RX ===== */
+      while (true) {
 
-      if (strncmp(msg, "HM,", 3) == 0) {
+        char* sep = strchr(start, ';');
 
-        char node[4];
-
-        sscanf(msg, "HM,%3[^,]", node);
-
-        if (strcmp(node, NODE_SHORT) == 0)
-          return;
-
-        int rssi = LoRa.packetRssi();
-
-        updateMesh(node, rssi);
-
-        Serial.print("[MESH] Node discovered: ");
-        Serial.println(node);
-      }
-      /* ===== HR METRIC ===== */
-
-      if (msg[0] == 'R') {
-
-        char node[4];
-        int rssi;
-
-        sscanf(msg, "R,%3[^,],%d", node, &rssi);
-
-        if (strcmp(node, NODE_SHORT) != 0)
-          return;  // not for me
-
-        Serial.printf("[DISCOVERY] GW RSSI = %d\n", rssi);
-
-        updateGatewayRSSI(NODE_SHORT, rssi);
-      }
-
-      /* ===== MT METRIC ===== */
-
-      if (msg[0] == 'M') {
-
-        char node[4];
-        int rssi;
-
-        sscanf(msg, "M,%3[^,],%d", node, &rssi);
-
-        if (strcmp(node, NODE_SHORT) == 0)
-          return;  // ignore own metric
-
-        updateGatewayRSSI(node, rssi);
-
-        Serial.printf("[METRIC] Node %s gwRSSI=%d\n", node, rssi);
-      }
-
-      /* ===== CMD ===== */
-
-      if (msg[0] == 'C') {
-
-        if (cmdProcessing && millis() < cmdLockUntil) {
-
-          Serial.println("[CMD] Locked");
-
-          return;
+        if (sep != NULL) {
+          *sep = '\0';
         }
 
-        cmdProcessing = true;
+        char* pkt = start;
 
-        cmdLockUntil = millis() + CMD_LOCK_TIME;
-        txBlockedUntil = millis() + 3000;
+        /* ================= DUPLICATE CHECK ================= */
 
-        int soil_now = readSoil();
+        bool needDupCheck =
+          (pkt[0] == 'D' || pkt[0] == 'S' || pkt[0] == 'A' || pkt[0] == 'C' || strncmp(pkt, "BATCH", 5) == 0);
 
-        char* v[6];
-        int idx = 0;
+        if (needDupCheck && packetSeen(pkt)) {
+          Serial.println("[DROP] duplicate packet");
+        } else {
 
-        char* token = strtok(msg, ",");
+          char type = pkt[0];
 
-        while (token && idx < 5) {
+          /* ======================================================
+         HEARTBEAT  (XỬ LÝ SỚM)
+         ====================================================== */
 
-          v[idx++] = token;
-          token = strtok(NULL, ",");
-        }
+          if (type == 'B') {
 
-        if (idx < 4) return;
+            char target[8];
 
-        const char* target = v[2];
-        const char* cmd_id = v[3];
-        const char* action = v[4];
+            if (sscanf(pkt, "B,%7s", target) == 1) {
 
-        if (strcmp(target, NODE_ID) == 0) {
+              if (strcmp(target, "ALL") == 0 || strcmp(target, NODE_SHORT) == 0) {
 
-          last_trigger_soil = soil_now;
+                lastGatewaySeen = millis();
 
-          bool success = true;
-
-          String errorCode = "No";
-          String message = "OK";
-
-          if (strcmp(action, "ON") == 0) {
-
-            strcpy(mode, "CLD");
-            pumpStatus = true;
-
-          } else if (strcmp(action, "OFF") == 0) {
-
-            strcpy(mode, "CLD");
-            pumpStatus = false;
-
-          } else if (strcmp(action, "AUTO") == 0) {
-
-            strcpy(mode, "SEN");
-
-          } else {
-
-            success = false;
-
-            errorCode = "INVALID_CMD";
-
-            message = "Unknown action";
-          }
-
-          digitalWrite(PIN_RELAY, pumpStatus ? LOW : HIGH);
-
-          unsigned long executedAt = millis();
-
-          char modeShort;
-
-          if (strcmp(mode, "SEN") == 0) modeShort = 'S';
-          else if (strcmp(mode, "CLD") == 0) modeShort = 'C';
-          else modeShort = 'R';
-
-          int pumpShort = pumpStatus ? 1 : 0;
-
-          int flowShort = (int)(default_flow * 10);
-          int ampShort = (int)(default_amp * 10);
-
-          char ack[128];
-
-          snprintf(ack, sizeof(ack),
-                   "A,%s,GW,%d,%s,%d,%s,%s,%d,%c,%d,%d,%d,%lu",
-                   NODE_SHORT,
-                   MAX_HOP,
-                   cmd_id,
-                   success ? 1 : 0,
-                   errorCode.c_str(),
-                   message.c_str(),
-                   pumpShort,
-                   modeShort,
-                   flowShort,
-                   ampShort,
-                   (int)last_trigger_soil,
-                   executedAt);
-
-          Serial.print("[LORA][TX ACK] ");
-          Serial.println(ack);
-
-          delay(80);
-          sendUplink(ack);
-
-          lastAckTime = millis();
-
-          lastStatusSend = millis();
-          lastSensorSend = millis();
-
-          cmdProcessing = false;
-          txBlockedUntil = millis() + 3000;
-        }
-      }
-      /* ===== ROUTE FORWARD ===== */
-
-      if (isRoutable(msg[0])) {
-
-        char type;
-        char src[4];
-        char dest[4];
-        int hop;
-        char data[96];
-
-        if (sscanf(msg, "%c,%3[^,],%3[^,],%d,%95[^\n]",
-                   &type, src, dest, &hop, data)
-            < 4)
-          return;
-
-        if (hop <= 0) {
-          Serial.println("[DROP] hop=0");
-          return;
-        }
-
-        hop--;
-        if (hop == 0) {
-          Serial.println("[DROP] TTL expired");
-          return;
-        }
-        if (strcmp(dest, NODE_SHORT) == 0) {
-
-          Serial.println("[ROUTE] packet for me");
-
-          // process command or data
-          return;
-        }
-
-        if (strcmp(dest, "GW") == 0 && !isLeader && strlen(leaderId) > 0) {
-          if (strcmp(src, NODE_SHORT) == 0)
-            return;
-          Serial.println("[ROUTE] forward to leader");
-
-          char rest[96];
-
-          char* p = strchr(msg, ',');
-          p = strchr(p + 1, ',');
-          p = strchr(p + 1, ',');
-
-          strcpy(rest, p + 1);
-
-          char fwd[128];
-
-          snprintf(
-            fwd,
-            sizeof(fwd),
-            "%c,%s,%s,%d,%s",
-            type,
-            src,
-            dest,
-            hop,
-            rest);
-
-          sendUplink(fwd);
-          return;
-        }
-
-        if (isLeader) {
-
-          if (type == 'D') {
-
-            if (sensorCount < LEADER_BUF) {
-
-              sscanf(msg, "%*c,%3[^,],%*[^,],%*d,%f,%f,%d,%d",
-                     sensorBuf[sensorCount].node,
-                     &sensorBuf[sensorCount].t,
-                     &sensorBuf[sensorCount].h,
-                     &sensorBuf[sensorCount].soil,
-                     &sensorBuf[sensorCount].light);
-
-              sensorCount++;
-
-              Serial.printf("[LEADER] sensor cached (%d)\n", sensorCount);
-
-              if (sensorCount >= LEADER_TRIGGER) {
-                flushSensorBatch();
+                Serial.println("[HB] Gateway alive");
               }
+
+              if (isLeader) {
+                sendUplink(pkt);
+              }
+
+            } else {
+              Serial.println("[HB] malformed");
+            }
+          }
+          /* ===== CMD ===== */
+
+          else if (pkt[0] == 'C') {
+
+            if (cmdProcessing && millis() < cmdLockUntil) {
+
+              Serial.println("[CMD] Locked");
+
+              return;
             }
 
-            return;
-          }
+            cmdProcessing = true;
 
-          if (type == 'S') {
+            cmdLockUntil = millis() + CMD_LOCK_TIME;
+            txBlockedUntil = millis() + 3000;
 
-            if (statusCount < LEADER_BUF) {
+            int soil_now = readSoil();
 
-              sscanf(msg, "%*c,%3[^,],%*[^,],%*d,%d,%3[^,],%*d,%*d,%*d,%d",
-                     statusBuf[statusCount].node,
-                     &statusBuf[statusCount].pump,
-                     statusBuf[statusCount].mode,
-                     &statusBuf[statusCount].soil);
+            char* v[6];
+            int idx = 0;
 
-              statusCount++;
+            char copy[128];
+            strcpy(copy, pkt);
 
-              Serial.printf("[LEADER] status cached (%d)\n", statusCount);
+            char* token = strtok(copy, ",");
 
-              if (statusCount >= LEADER_TRIGGER) {
-                flushStatusBatch();
-              }
+            while (token && idx < 5) {
+
+              v[idx++] = token;
+              token = strtok(NULL, ",");
             }
 
-            return;
+            if (idx < 4) return;
+
+            const char* target = v[2];
+            const char* cmd_id = v[3];
+            const char* action = v[4];
+
+            if (strcmp(target, NODE_ID) == 0) {
+
+              last_trigger_soil = soil_now;
+
+              bool success = true;
+
+              String errorCode = "No";
+              String message = "OK";
+
+              if (strcmp(action, "ON") == 0) {
+
+                strcpy(mode, "CLD");
+                pumpStatus = true;
+
+              } else if (strcmp(action, "OFF") == 0) {
+
+                strcpy(mode, "CLD");
+                pumpStatus = false;
+
+              } else if (strcmp(action, "AUTO") == 0) {
+
+                strcpy(mode, "SEN");
+
+              } else {
+
+                success = false;
+
+                errorCode = "INVALID_CMD";
+
+                message = "Unknown action";
+              }
+
+              digitalWrite(PIN_RELAY, pumpStatus ? LOW : HIGH);
+
+              unsigned long executedAt = millis();
+
+              char modeShort;
+
+              if (strcmp(mode, "SEN") == 0) modeShort = 'S';
+              else if (strcmp(mode, "CLD") == 0) modeShort = 'C';
+              else modeShort = 'R';
+
+              int pumpShort = pumpStatus ? 1 : 0;
+
+              int flowShort = (int)(default_flow * 10);
+              int ampShort = (int)(default_amp * 10);
+
+              char ack[128];
+
+              snprintf(ack, sizeof(ack),
+                       "A,%s,GW,%d,%s,%d,%s,%s,%d,%c,%d,%d,%d,%lu",
+                       NODE_SHORT,
+                       MAX_HOP,
+                       cmd_id,
+                       success ? 1 : 0,
+                       errorCode.c_str(),
+                       message.c_str(),
+                       pumpShort,
+                       modeShort,
+                       flowShort,
+                       ampShort,
+                       (int)last_trigger_soil,
+                       executedAt);
+
+              Serial.print("[LORA][TX ACK] ");
+              Serial.println(ack);
+
+              delay(80);
+              sendUplink(ack);
+
+              lastAckTime = millis();
+
+              lastStatusSend = millis();
+              lastSensorSend = millis();
+
+              cmdProcessing = false;
+              txBlockedUntil = millis() + 3000;
+            }
+          }
+          /* ======================================================
+         HELLO MESH
+         ====================================================== */
+
+          else if (strncmp(pkt, "HM,", 3) == 0) {
+
+            char node[4];
+
+            if (sscanf(pkt, "HM,%3[^,\r\n]", node) == 1) {
+
+              if (strcmp(node, NODE_SHORT) != 0) {
+
+                int rssi = LoRa.packetRssi();
+
+                updateMesh(node, rssi);
+
+              } else {
+                Serial.println("[MESH] ignore self");
+              }
+
+            } else {
+              Serial.println("[MESH] malformed HM");
+            }
           }
 
-          sendUplink(msg);
+          /* ======================================================
+         GW RSSI METRIC
+         ====================================================== */
+
+          else if (type == 'R') {
+
+            char node[4];
+            int rssi;
+
+            if (sscanf(pkt, "R,%3[^,],%d", node, &rssi) == 2) {
+
+              Serial.printf("[METRIC][GW] node=%s rssi=%d\n", node, rssi);
+
+              if (strcmp(node, NODE_SHORT) == 0) {
+
+                updateGatewayRSSI(NODE_SHORT, rssi);
+
+                if (nodeState == NODE_DISCOVERY && discState == DISC_WAIT_R) {
+
+                  Serial.println("[DISCOVERY] GW RSSI received");
+
+                  discState = DISC_HELLO_MESH;
+                }
+
+              } else {
+
+                Serial.println("[METRIC] not for me");
+              }
+
+            } else {
+              Serial.println("[METRIC] malformed R");
+            }
+          }
+
+          /* ======================================================
+         NODE METRIC
+         ====================================================== */
+
+          else if (type == 'M') {
+
+            char node[4];
+            int rssi;
+
+            if (sscanf(pkt, "M,%3[^,],%d", node, &rssi) == 2) {
+
+              if (strcmp(node, NODE_SHORT) != 0) {
+
+                updateGatewayRSSI(node, rssi);
+
+                updateLastSeen(node);
+
+              } else {
+
+                Serial.println("[MESH] ignore self");
+              }
+
+            } else {
+              Serial.println("[METRIC NODE] malformed");
+            }
+          }
+
+          /* ======================================================
+         JOIN REPLY
+         ====================================================== */
+
+          else if (strncmp(pkt, "JR,", 3) == 0) {
+
+            if (networkFormed || strlen(leaderId) > 0) {
+
+              Serial.println("[JOIN] ignore JR (already in mesh)");
+
+            } else {
+
+              char leader[4];
+
+              if (sscanf(pkt, "JR,%3[^,\r\n]", leader) == 1) {
+
+                strcpy(leaderId, leader);
+
+                networkFormed = true;
+                leaderLocked = true;
+
+                discState = DISC_DONE;
+                nodeState = NODE_NETWORK_READY;
+
+                lastLeaderSeen = millis();
+
+                Serial.printf("[JOIN] connected to leader %s\n", leaderId);
+
+              } else {
+
+                Serial.println("[JOIN] malformed JR");
+              }
+            }
+          }
+
+          /* ======================================================
+         LEADER ANNOUNCE
+         ====================================================== */
+
+          else if (strncmp(pkt, "L,", 2) == 0) {
+
+            char leader[4];
+
+            if (sscanf(pkt, "L,%3s", leader) == 1) {
+
+              strcpy(leaderId, leader);
+
+              networkFormed = true;
+              leaderLocked = true;
+
+              isLeader = strcmp(leaderId, NODE_SHORT) == 0;
+
+              nodeState = NODE_NETWORK_READY;
+
+              Serial.print("[LEADER] network leader = ");
+              Serial.println(leaderId);
+
+            } else {
+
+              Serial.println("[LEADER] malformed");
+            }
+          }
+
+          /* ======================================================
+         LEADER HEARTBEAT
+         ====================================================== */
+
+          else if (strncmp(pkt, "HL,", 3) == 0) {
+
+            char leader[4];
+
+            if (sscanf(pkt, "HL,%3[^,\r\n]", leader) == 1) {
+
+              if (strcmp(leader, leaderId) == 0) {
+
+                lastLeaderSeen = millis();
+
+                Serial.println("[HB] Leader alive");
+              }
+
+            } else {
+
+              Serial.println("[HL] malformed");
+            }
+          }
+          /* ======================================================
+            JOIN REQUEST
+            ====================================================== */
+
+          else if (strncmp(pkt, "J,", 2) == 0) {
+
+            char node[4];
+
+            if (sscanf(pkt, "J,%3[^,\r\n]", node) == 1) {
+
+              if (strcmp(node, NODE_SHORT) == 0) {
+                Serial.println("[JOIN] ignore self");
+              }
+
+              else if (!isLeader) {
+
+                Serial.println("[JOIN] ignore (not leader)");
+
+              }
+
+              else {
+
+                Serial.printf("[JOIN] request from %s\n", node);
+
+                updateLastSeen(node);
+                updateGatewayRSSI(node, -120);
+
+                char reply[16];
+
+                snprintf(reply,
+                         sizeof(reply),
+                         "JR,%s",
+                         leaderId);
+
+                sendUplink(reply);
+
+                Serial.printf("[JOIN] accepted %s\n", node);
+              }
+
+            } else {
+
+              Serial.println("[JOIN] malformed");
+            }
+          }
+
+          /* ======================================================
+        ROUTABLE PACKETS
+        ====================================================== */
+
+          else if (isRoutable(type)) {
+
+            char src[4];
+            char dest[4];
+            int hop;
+            char data[96];
+
+            int ok = sscanf(pkt,
+                            "%c,%3[^,],%3[^,],%d,%95[^\n]",
+                            &type,
+                            src,
+                            dest,
+                            &hop,
+                            data);
+
+            if (ok < 4) {
+
+              Serial.println("[ROUTE] malformed");
+
+            } else {
+
+              updateLastSeen(src);
+
+              if (hop <= 0) {
+
+                Serial.println("[DROP] hop=0");
+
+              } else {
+
+                hop--;
+
+                if (hop == 0) {
+
+                  Serial.println("[DROP] TTL expired");
+
+                }
+
+                else {
+
+                  /* ======================================
+           PACKET FOR THIS NODE
+           ====================================== */
+
+                  if (strcmp(dest, NODE_SHORT) == 0) {
+
+                    Serial.println("[ROUTE] packet for me");
+
+                  }
+
+                  /* ======================================
+           ROUTE TO GATEWAY
+           ====================================== */
+
+                  else if (strcmp(dest, "GW") == 0 && !isLeader && strlen(leaderId) > 0) {
+
+                    Serial.println("[ROUTE] forward to leader");
+
+                    char fwd[128];
+
+                    snprintf(fwd,
+                             sizeof(fwd),
+                             "%c,%s,%s,%d,%s",
+                             type,
+                             src,
+                             dest,
+                             hop,
+                             data);
+
+                    sendUplink(fwd);
+
+                  }
+
+                  /* ======================================
+           LEADER HANDLING
+           ====================================== */
+
+                  else if (isLeader) {
+
+                    /* ===== SENSOR DATA ===== */
+
+                    if (type == 'D') {
+
+                      if (sensorCount < LEADER_BUF) {
+
+                        sscanf(pkt,
+                               "%*c,%3[^,],%*[^,],%*d,%f,%f,%d,%d",
+                               sensorBuf[sensorCount].node,
+                               &sensorBuf[sensorCount].t,
+                               &sensorBuf[sensorCount].h,
+                               &sensorBuf[sensorCount].soil,
+                               &sensorBuf[sensorCount].light);
+
+                        sensorCount++;
+
+                        Serial.printf("[LEADER] sensor cached (%d)\n",
+                                      sensorCount);
+
+                        if (sensorCount >= LEADER_TRIGGER) {
+                          flushSensorBatch();
+                        }
+                      }
+
+                    }
+
+                    /* ===== STATUS DATA ===== */
+
+                    else if (type == 'S') {
+
+                      if (statusCount < LEADER_BUF) {
+
+                        sscanf(pkt,
+                               "%*c,%3[^,],%*[^,],%*d,%d,%3[^,],%*d,%*d,%*d,%d",
+                               statusBuf[statusCount].node,
+                               &statusBuf[statusCount].pump,
+                               statusBuf[statusCount].mode,
+                               &statusBuf[statusCount].soil);
+
+                        statusCount++;
+
+                        Serial.printf("[LEADER] status cached (%d)\n",
+                                      statusCount);
+
+                        if (statusCount >= LEADER_TRIGGER) {
+                          flushStatusBatch();
+                        }
+                      }
+                    }
+
+                    /* ===== FORWARD TO GW ===== */
+
+                    // sendUplink(pkt);
+                  }
+                }
+              }
+            }
+          }
+
+          /* ======================================================
+         UNKNOWN PACKET
+         ====================================================== */
+
+          else {
+
+            Serial.println("[LORA] Unknown packet");
+          }
         }
-      }
 
-      if (strncmp(msg, "L,", 2) == 0) {
+        if (sep == NULL)
+          break;
 
-        char leader[4];
-
-        sscanf(msg, "L,%3s", leader);
-
-        strcpy(leaderId, leader);
-
-        networkFormed = true;
-        leaderLocked = true;
-
-        isLeader = strcmp(leaderId, NODE_SHORT) == 0;
-
-        nodeState = NODE_NETWORK_READY;
-
-        Serial.print("[LEADER] network leader = ");
-        Serial.println(leaderId);
-      }
-      /* ===== HEARTBEAT ===== */
-
-      if (msg[0] == 'B') {
-        char target[8];
-
-        sscanf(msg, "B,%7s", target);
-
-        if (strcmp(target, "ALL") == 0 || strcmp(target, NODE_SHORT) == 0) {
-          lastGatewaySeen = millis();
-
-          Serial.println("[HB] Gateway alive");
-        }
-
-        if (isLeader) {
-          sendUplink(msg);  // forward heartbeat
-        }
-      }
-
-      if (strncmp(msg, "HL,", 3) == 0) {
-        char leader[4];
-
-        sscanf(msg, "HL,%3s", leader);
-
-        if (strcmp(leader, leaderId) == 0) {
-          lastLeaderSeen = millis();
-
-          Serial.println("[HB] Leader alive");
-        }
+        start = sep + 1;
       }
     }
   }
@@ -1015,6 +1267,8 @@ void loop() {
   }
 
   for (int i = 0; i < meshCount; i++) {
+    if (strcmp(meshTable[i].id, NODE_SHORT) == 0)
+      continue;
     if (millis() - meshTable[i].lastSeen > 30000) {
       Serial.printf("[MESH] node %s timeout\n", meshTable[i].id);
 
@@ -1022,6 +1276,7 @@ void loop() {
         meshTable[j] = meshTable[j + 1];
 
       meshCount--;
+      i--;
     }
   }
 
@@ -1042,9 +1297,11 @@ void loop() {
   }
 
   if (millis() - lastGatewaySeen > HEARTBEAT_TIMEOUT) {
-    Serial.println("[AUTO MODE] Gateway lost");
 
-    strcpy(mode, "SEN");
+    if (strcmp(mode, "SEN") != 0) {
+      Serial.println("[AUTO MODE] Gateway lost");
+      strcpy(mode, "SEN");
+    }
   }
 
   digitalWrite(PIN_RELAY, pumpStatus ? LOW : HIGH);
@@ -1160,20 +1417,12 @@ void loop() {
     }
   }
 
-  /* ================= LEADER CHECK ================= */
-
-  // if (millis() - lastLeaderCheck > LEADER_CHECK_INTERVAL) {
-
-  //   lastLeaderCheck = millis();
-
-  //   electLeader();
-  // }
-
   if (isLeader && networkFormed && millis() - lastLeaderHB > LEADER_HB_INTERVAL) {
     char hb[16];
 
     snprintf(hb, sizeof(hb), "HL,%s", NODE_SHORT);
 
+    delay(random(50, 200));
     sendUplink(hb);
 
     Serial.println("[LEADER HB] sent");
@@ -1195,25 +1444,96 @@ void loop() {
 
   /* ================= HELLO SEND ================= */
 
-  if (nodeState == NODE_DISCOVERY && millis() - lastHello > HELLO_INTERVAL + random(0, 1000)) {
-    lastHello = millis();
+  if (nodeState == NODE_DISCOVERY) {
 
-    sendHelloGW();
-    delay(random(100, 300));
+    switch (discState) {
 
-    sendHelloMesh();
-    delay(random(100, 300));
+      case DISC_HELLO_GW:
 
-    broadcastMetric();
+        if (millis() - lastHello > HELLO_INTERVAL + random(0, 500)) {
 
-    Serial.println("[METRIC TABLE]");
+          lastHello = millis();
 
-    for (int i = 0; i < nodeCount; i++) {
+          sendHelloGW();
 
-      Serial.printf("Node:%s GW_RSSI:%d Age:%lu\n",
-                    nodeTable[i].id,
-                    nodeTable[i].gwRssi,
-                    millis() - nodeTable[i].lastUpdate);
+          helloSentTime = millis();
+
+          discState = DISC_WAIT_R;
+        }
+
+        break;
+
+      case DISC_WAIT_R:
+
+        /* wait gateway reply */
+
+        if (millis() - helloSentTime > 5000) {
+
+          Serial.println("[DISCOVERY] GW reply timeout");
+
+          discState = DISC_HELLO_GW;
+        }
+
+        break;
+
+      case DISC_HELLO_MESH:
+
+        delay(random(50, 200));
+
+        sendHelloMesh();
+
+        Serial.println("[DISCOVERY] HELLO_MESH broadcast");
+
+        printMeshTable();
+
+        if (meshCount > 0) {
+          Serial.println("[DISCOVERY] mesh nodes detected");
+        } else {
+          Serial.println("[DISCOVERY] no mesh found");
+        }
+
+        delay(random(50, 200));
+
+        discState = DISC_SEND_METRIC;
+
+        break;
+
+      case DISC_SEND_METRIC:
+
+        broadcastMetric();
+
+        printMetricTable();
+
+        discState = DISC_DONE;
+
+        break;
+      case DISC_DONE:
+
+        if (!networkFormed && !joinScheduled) {
+
+          joinScheduled = true;
+
+          joinTime = millis() + random(3000, 8000);
+
+          Serial.println("[DISCOVERY] mesh found -> scheduling JOIN");
+        }
+
+        if (joinScheduled && !joinSent && millis() > joinTime) {
+
+          char payload[16];
+
+          snprintf(payload, sizeof(payload),
+                   "J,%s",
+                   NODE_SHORT);
+
+          Serial.println("[DISCOVERY] sending JOIN");
+
+          sendUplink(payload);
+
+          joinSent = true;
+        }
+
+        break;
     }
   }
 
