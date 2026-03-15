@@ -3,6 +3,8 @@ import paho.mqtt.client as mqtt
 import redis
 import json
 from datetime import datetime
+import threading
+import time
 
 # ================= CONFIG =================
 MQTT_BROKER = "localhost"
@@ -12,7 +14,7 @@ MQTT_TOPICS = [
     ("garden/control/ack", 1)
 ]
 
-GATEWAY_WHITELIST = {"ESP32_GATEWAY_01"}
+GATEWAY_WHITELIST = {"GW_01"}
 NODE_WHITELIST = {"NODE_01", "NODE_02", "NODE_03"}
 
 REDIS_HOST = "127.0.0.1"
@@ -20,8 +22,9 @@ REDIS_PORT = 6379
 HTTP_PORT = 5000
 
 MODE_MAP = {
-    "SEN": "SENSOR",
-    "CLD": "CLOUD"
+    "S": "SENSOR",
+    "C": "CLOUD",
+    "R": "READY"
 }
 # =========================================
 
@@ -70,6 +73,41 @@ def safe_int(val):
 def now_iso():
     return datetime.now().isoformat()
 
+def node_watchdog():
+
+    while True:
+
+        for k in rds.scan_iter("node:status:*"):
+
+            raw = rds.get(k)
+
+            if not raw:
+                continue
+
+            data = json.loads(raw)
+
+            updated = data.get("updated_at")
+
+            if not updated:
+                continue
+
+            dt = datetime.fromisoformat(updated)
+
+            if (datetime.now() - dt).seconds > 60:
+
+                node_id = data["node_id"]
+
+                payload = {
+                    "type": "STATUS",
+                    "node_id": node_id,
+                    "current_status": "OFFLINE",
+                    "updated_at": now_iso()
+                }
+
+                rds.publish("node_updates", json.dumps(payload))
+
+        time.sleep(20)
+
 # ---------- MQTT HANDLERS ----------
 
 def handle_operating_status(data: dict):
@@ -81,19 +119,21 @@ def handle_operating_status(data: dict):
         
         old_raw = redis_safe_call(rds.get, f"node:status:{node_id}")
         old_status = json.loads(old_raw) if old_raw else {}
+        mode_short = data.get("mode")
+        mode = MODE_MAP.get(mode_short, "UNKNOWN")
 
         payload = {
             "node_id": node_id,
             "rssi": safe_int(data.get("rssi")),
             "pump": data.get("pump"),
-            "mode": data.get("mode"),
+            "mode": mode,
             "amp": safe_float(data.get("amp")),
             "flow": safe_float(data.get("flow")),
             "last_soil": safe_float(data.get("last_soil")),
             "uptime": safe_int(data.get("uptime")),
             "current_status": data.get("current_status"),
             "updated_at": now_iso(),
-            "previous_status": "UNKNOWN",
+            "previous_status": old_status.get("current_status", "UNKNOWN"),
             "source": "realtime",
             "type": "STATUS"
         }
@@ -102,7 +142,7 @@ def handle_operating_status(data: dict):
             rds.set,
             f"node:status:{node_id}",
             json.dumps(payload),
-            ex=30
+            ex=90
         )
 
         redis_safe_call(
@@ -276,16 +316,15 @@ def ingest_batch():
             if node_id not in NODE_WHITELIST:
                 continue
 
-            measured_at = m.get("measured_at") or batch_time
+            measured_at = m.get("ts") or batch_time
 
             record = {
                 "node_id": node_id,
-                "temp": safe_float(m.get("temp")),
-                "humi": safe_float(m.get("humi")),
-                "soil": safe_float(m.get("soil")),
-                "light": safe_float(m.get("light")),
-                "created_at": measured_at,
-                "batch_sent_at": batch_time   # nếu muốn lưu
+                "temp": safe_float(m.get("t")),
+                "humi": safe_float(m.get("h")),
+                "soil": safe_float(m.get("s")),
+                "light": safe_float(m.get("l")),
+                "created_at": measured_at
             }
     
             redis_safe_call(
@@ -319,6 +358,8 @@ def start():
     mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
     mqtt_client.loop_start()
     mqtt_client.reconnect_delay_set(min_delay=1, max_delay=5)
+
+    threading.Thread(target=node_watchdog, daemon=True).start()
 
     app.run(host="0.0.0.0", port=HTTP_PORT)
 

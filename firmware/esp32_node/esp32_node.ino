@@ -28,14 +28,14 @@ const char NODE_SHORT[] = "02";
    INTERVAL CONFIG
    ========================================================= */
 
-const unsigned long STATUS_INTERVAL = 5000;
-const unsigned long SENSOR_INTERVAL = 20000;
+const unsigned long STATUS_INTERVAL = 10000;
+const unsigned long SENSOR_INTERVAL = 25000;
 
-const unsigned long HEARTBEAT_TIMEOUT = 60000;
+const unsigned long HEARTBEAT_TIMEOUT = 75000;
 
 const unsigned long SOIL_INTERVAL = 2000;
 
-const unsigned long HELLO_INTERVAL = 7000;
+const unsigned long HELLO_INTERVAL = 10000;
 const unsigned long DISCOVERY_WINDOW = 30000;
 
 /* =========================================================
@@ -83,7 +83,7 @@ DHT dht(PIN_DHT, DHT11);
 bool loraReady = false;
 bool pumpStatus = false;
 
-char mode[8] = "READY";
+char mode[4] = "R";
 
 float default_amp = 0.5;
 float default_flow = 1.2;
@@ -107,7 +107,7 @@ unsigned long txBlockedUntil = 0;
 
 unsigned long lastGatewaySeen = 0;
 
-#define PACKET_CACHE 32
+#define PACKET_CACHE 64
 
 uint32_t packetCache[PACKET_CACHE];
 int packetIndex = 0;
@@ -123,8 +123,8 @@ NodeState nodeState = NODE_BOOT;
 unsigned long discoveryStart = 0;
 unsigned long lastLeaderSeen = 0;
 
-const unsigned long LEADER_TIMEOUT = 30000;
-const unsigned long LEADER_HB_INTERVAL = 10000;
+const unsigned long LEADER_TIMEOUT = 60000;
+const unsigned long LEADER_HB_INTERVAL = 15000;
 
 unsigned long lastLeaderHB = 0;
 
@@ -142,6 +142,8 @@ unsigned long helloSentTime = 0;
 bool joinSent = false;
 bool joinScheduled = false;
 unsigned long joinTime = 0;
+
+uint16_t packetSeq = 0;
 
 /* =========================================================
    COMMAND PROCESS
@@ -162,10 +164,10 @@ int cachedSoil = 0;
    ========================================================= */
 
 #define LEADER_BUF 6
-#define LEADER_TRIGGER 3
+#define LEADER_TRIGGER 5
 
 struct LeaderSensorPacket {
-  char node[8];
+  char node[4];
   float t;
   float h;
   int soil;
@@ -173,9 +175,9 @@ struct LeaderSensorPacket {
 };
 
 struct LeaderStatusPacket {
-  char node[8];
+  char node[4];
   int pump;
-  char mode[4];
+  char mode;
   int soil;
 };
 
@@ -205,7 +207,6 @@ bool leaderLocked = false;
 bool networkFormed = false;
 
 unsigned long lastHello = 0;
-unsigned long lastJoinAttempt = 0;
 
 /* =========================================================
    LORA INIT
@@ -246,6 +247,14 @@ void initLoRa() {
   loraReady = false;
 }
 
+bool validNode(const char* id) {
+
+  if (strcmp(id, "01") == 0) return true;
+  if (strcmp(id, "02") == 0) return true;
+  if (strcmp(id, "03") == 0) return true;
+
+  return false;
+}
 
 /* =========================================================
    SENSOR PROCESSING
@@ -302,12 +311,12 @@ void flushSensorBatch() {
 
   int offset = 0;
 
-  offset += sprintf(packet, "BATCHSEN,");
+  offset += sprintf(packet, "BS,");
 
   for (int i = 0; i < sensorCount; i++) {
 
     offset += sprintf(packet + offset,
-                      "D,%s,%.1f,%.1f,%d,%d;",
+                      "%s,%.1f,%.1f,%d,%d;",
                       sensorBuf[i].node,
                       sensorBuf[i].t,
                       sensorBuf[i].h,
@@ -330,16 +339,21 @@ void flushStatusBatch() {
 
   int offset = 0;
 
-  offset += sprintf(packet, "BATCHSTA,");
+  offset += sprintf(packet, "BT,");
 
   for (int i = 0; i < statusCount; i++) {
 
+    int amp = (int)(default_amp * 10);
+    int flow = (int)(default_flow * 10);
+
     offset += sprintf(packet + offset,
-                      "S,%s,%d,%s,%d;",
+                      "%s,%d,%c,%d,%d,%d;",
                       statusBuf[i].node,
                       statusBuf[i].pump,
                       statusBuf[i].mode,
-                      statusBuf[i].soil);
+                      statusBuf[i].soil,
+                      amp,
+                      flow);
   }
 
   Serial.println("[LEADER] STATUS BATCH -> GW");
@@ -638,17 +652,20 @@ void electLeader() {
   Serial.println(isLeader ? "YES" : "NO");
 }
 
-bool packetSeen(const char* p) {
-  uint32_t h = 0;
-  const char* temp = p;
-  while (*temp) {
-    h = (h * 33) ^ *temp++;
-  }
+bool packetSeen(const char* src, uint16_t seq) {
+
+  uint32_t id = ((uint32_t)seq << 16) | ((uint32_t)src[0] << 8) | src[1];
+
   for (int i = 0; i < PACKET_CACHE; i++) {
-    if (packetCache[i] == h) return true;
+
+    if (packetCache[i] == id) return true;
   }
-  packetCache[packetIndex++] = h;
-  if (packetIndex >= PACKET_CACHE) packetIndex = 0;
+
+  packetCache[packetIndex++] = id;
+
+  if (packetIndex >= PACKET_CACHE)
+    packetIndex = 0;
+
   return false;
 }
 
@@ -721,12 +738,31 @@ void loop() {
         char* pkt = start;
 
         /* ================= DUPLICATE CHECK ================= */
+        char src[4] = "";
+        char dest[4] = "";
+        uint16_t seq = 0;
+        int hop = 0;
 
         bool needDupCheck =
-          (pkt[0] == 'D' || pkt[0] == 'S' || pkt[0] == 'A' || pkt[0] == 'C' || strncmp(pkt, "BATCH", 5) == 0);
+          (pkt[0] == 'D' || pkt[0] == 'S' || pkt[0] == 'A' || pkt[0] == 'C');
 
-        if (needDupCheck && packetSeen(pkt)) {
-          Serial.println("[DROP] duplicate packet");
+        if (needDupCheck) {
+
+          int ok = sscanf(pkt,
+                          "%*c,%3[^,],%3[^,],%d,%hu",
+                          src,
+                          dest,
+                          &hop,
+                          &seq);
+
+          if (ok == 4 && packetSeen(src, seq)) {
+            Serial.println("[DROP] duplicate packet");
+            goto next_packet;
+          }
+          if (!validNode(src) && strcmp(src, "GW") != 0) {
+            Serial.println("[SECURITY] invalid SRC");
+            goto next_packet;
+          }
         } else {
 
           char type = pkt[0];
@@ -782,13 +818,16 @@ void loop() {
 
             char* token = strtok(copy, ",");
 
-            while (token && idx < 5) {
+            while (token && idx < 6) {
 
               v[idx++] = token;
               token = strtok(NULL, ",");
             }
 
-            if (idx < 4) return;
+            if (idx < 6) {
+              cmdProcessing = false;
+              return;
+            }
 
             const char* target = v[2];
             const char* cmd_id = v[3];
@@ -800,22 +839,26 @@ void loop() {
 
               bool success = true;
 
-              String errorCode = "No";
-              String message = "OK";
+              const char* errorCode = "No";
+              const char* message = "OK";
 
               if (strcmp(action, "ON") == 0) {
 
-                strcpy(mode, "CLD");
+                mode[0] = 'C';
+                mode[1] = '\0';
+
                 pumpStatus = true;
 
               } else if (strcmp(action, "OFF") == 0) {
+                mode[0] = 'C';
+                mode[1] = '\0';
 
-                strcpy(mode, "CLD");
                 pumpStatus = false;
 
               } else if (strcmp(action, "AUTO") == 0) {
 
-                strcpy(mode, "SEN");
+                mode[0] = 'S';
+                mode[1] = '\0';
 
               } else {
 
@@ -830,11 +873,7 @@ void loop() {
 
               unsigned long executedAt = millis();
 
-              char modeShort;
-
-              if (strcmp(mode, "SEN") == 0) modeShort = 'S';
-              else if (strcmp(mode, "CLD") == 0) modeShort = 'C';
-              else modeShort = 'R';
+              char modeShort = mode[0];
 
               int pumpShort = pumpStatus ? 1 : 0;
 
@@ -849,8 +888,8 @@ void loop() {
                        MAX_HOP,
                        cmd_id,
                        success ? 1 : 0,
-                       errorCode.c_str(),
-                       message.c_str(),
+                       errorCode,
+                       message,
                        pumpShort,
                        modeShort,
                        flowShort,
@@ -1056,6 +1095,7 @@ void loop() {
 
               if (strcmp(node, NODE_SHORT) == 0) {
                 Serial.println("[JOIN] ignore self");
+                goto next_packet;
               }
 
               else if (!isLeader) {
@@ -1100,12 +1140,15 @@ void loop() {
             int hop;
             char data[96];
 
+            uint16_t seq;
+
             int ok = sscanf(pkt,
-                            "%c,%3[^,],%3[^,],%d,%95[^\n]",
+                            "%c,%3[^,],%3[^,],%d,%hu,%95[^\n]",
                             &type,
                             src,
                             dest,
                             &hop,
+                            &seq,
                             data);
 
             if (ok < 4) {
@@ -1116,7 +1159,7 @@ void loop() {
 
               updateLastSeen(src);
 
-              if (hop <= 0) {
+              if (hop <= 1) {
 
                 Serial.println("[DROP] hop=0");
 
@@ -1146,23 +1189,35 @@ void loop() {
            ROUTE TO GATEWAY
            ====================================== */
 
-                  else if (strcmp(dest, "GW") == 0 && !isLeader && strlen(leaderId) > 0) {
-
+                  else if (strcmp(dest, "GW") == 0 && !isLeader && strcmp(leaderId, "") != 0) {
+                    if (strcmp(src, NODE_SHORT) == 0) goto next_packet;
                     Serial.println("[ROUTE] forward to leader");
 
                     char fwd[128];
 
-                    snprintf(fwd,
-                             sizeof(fwd),
-                             "%c,%s,%s,%d,%s",
-                             type,
-                             src,
-                             dest,
-                             hop,
-                             data);
+                    if (ok >= 6) {
+                      snprintf(fwd,
+                               sizeof(fwd),
+                               "%c,%s,%s,%d,%u,%s",
+                               type,
+                               src,
+                               dest,
+                               hop,
+                               seq,
+                               data);
+
+                    } else {
+                      snprintf(fwd,
+                               sizeof(fwd),
+                               "%c,%s,%s,%d,%u",
+                               type,
+                               src,
+                               dest,
+                               hop,
+                               seq);
+                    }
 
                     sendUplink(fwd);
-
                   }
 
                   /* ======================================
@@ -1178,7 +1233,7 @@ void loop() {
                       if (sensorCount < LEADER_BUF) {
 
                         sscanf(pkt,
-                               "%*c,%3[^,],%*[^,],%*d,%f,%f,%d,%d",
+                               "%*c,%3[^,],%*[^,],%*d,%*u,%f,%f,%d,%d",
                                sensorBuf[sensorCount].node,
                                &sensorBuf[sensorCount].t,
                                &sensorBuf[sensorCount].h,
@@ -1204,10 +1259,10 @@ void loop() {
                       if (statusCount < LEADER_BUF) {
 
                         sscanf(pkt,
-                               "%*c,%3[^,],%*[^,],%*d,%d,%3[^,],%*d,%*d,%*d,%d",
+                               "S,%3[^,],%*[^,],%*d,%*u,%d,%c,%*lu,%*d,%*d,%d",
                                statusBuf[statusCount].node,
                                &statusBuf[statusCount].pump,
-                               statusBuf[statusCount].mode,
+                               &statusBuf[statusCount].mode,
                                &statusBuf[statusCount].soil);
 
                         statusCount++;
@@ -1221,9 +1276,9 @@ void loop() {
                       }
                     }
 
-                    /* ===== FORWARD TO GW ===== */
-
-                    // sendUplink(pkt);
+                    else if (type == 'A') {
+                      sendUplink(pkt);
+                    }
                   }
                 }
               }
@@ -1239,7 +1294,7 @@ void loop() {
             Serial.println("[LORA] Unknown packet");
           }
         }
-
+next_packet:
         if (sep == NULL)
           break;
 
@@ -1323,7 +1378,7 @@ void loop() {
 
         statusBuf[statusCount].pump = pumpStatus ? 1 : 0;
 
-        strcpy(statusBuf[statusCount].mode, mode);
+        statusBuf[statusCount].mode = mode[0];
 
         statusBuf[statusCount].soil = cachedSoil;
 
@@ -1338,18 +1393,20 @@ void loop() {
 
     } else {
       char payload[80];
+      packetSeq++;
 
       snprintf(payload, sizeof(payload),
-               "S,%s,%s,%d,%d,%s,%lu,%d,%d,%.0f",
+               "S,%s,%s,%d,%u,%d,%c,%lu,%d,%d,%d",
                NODE_SHORT,
                leaderId,
                MAX_HOP,
+               packetSeq,
                pumpStatus ? 1 : 0,
                mode,
                uptime,
                (int)(default_amp * 10),
                (int)(default_flow * 10),
-               last_trigger_soil);
+               (int)last_trigger_soil);
 
       Serial.print("[LORA][STATUS] ");
       Serial.println(payload);
@@ -1403,11 +1460,14 @@ void loop() {
     } else {
       char payload[80];
 
+      packetSeq++;
+
       snprintf(payload, sizeof(payload),
-               "D,%s,%s,%d,%.1f,%.1f,%d,%d",
+               "D,%s,%s,%d,%u,%.1f,%.1f,%d,%d",
                NODE_SHORT,
                leaderId,
                MAX_HOP,
+               packetSeq,
                ema_t,
                ema_h,
                cachedSoil,
