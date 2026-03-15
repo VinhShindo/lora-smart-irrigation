@@ -810,61 +810,53 @@ void loop() {
 
             int soil_now = readSoil();
 
-            char* v[6];
-            int idx = 0;
+            char src[4];
+            char dest[4];
+            int hop;
+            char cmd_id[32];
+            int action;
 
-            char copy[128];
-            strcpy(copy, pkt);
+            int ok = sscanf(pkt,
+                            "C,%3[^,],%3[^,],%d,%31[^,],%d",
+                            src,
+                            dest,
+                            &hop,
+                            cmd_id,
+                            &action);
 
-            char* token = strtok(copy, ",");
-
-            while (token && idx < 6) {
-
-              v[idx++] = token;
-              token = strtok(NULL, ",");
-            }
-
-            if (idx < 6) {
+            if (ok != 5) {
+              Serial.println("[CMD] malformed");
               cmdProcessing = false;
               return;
             }
 
-            const char* target = v[2];
-            const char* cmd_id = v[3];
-            const char* action = v[4];
-
-            if (strcmp(target, NODE_ID) == 0) {
+            if (strcmp(dest, NODE_SHORT) == 0) {
 
               last_trigger_soil = soil_now;
 
               bool success = true;
 
-              const char* errorCode = "No";
+              const char* errorCode = "N";
               const char* message = "OK";
 
-              if (strcmp(action, "ON") == 0) {
+              if (action == 1) {
 
-                mode[0] = 'C';
-                mode[1] = '\0';
-
+                strcpy(mode, "C");
                 pumpStatus = true;
 
-              } else if (strcmp(action, "OFF") == 0) {
-                mode[0] = 'C';
-                mode[1] = '\0';
+              } else if (action == 0) {
 
+                strcpy(mode, "C");
                 pumpStatus = false;
 
-              } else if (strcmp(action, "AUTO") == 0) {
+              } else if (action == 2) {
 
-                mode[0] = 'S';
-                mode[1] = '\0';
-
+                strcpy(mode, "SEN");
               } else {
 
                 success = false;
 
-                errorCode = "INVALID_CMD";
+                errorCode = "I";
 
                 message = "Unknown action";
               }
@@ -882,14 +874,22 @@ void loop() {
 
               char ack[128];
 
+              char errCode = 'N';
+              char msgCode = 'O';
+
+              if (!success) {
+                errCode = 'I';
+                msgCode = 'F';
+              }
+
               snprintf(ack, sizeof(ack),
-                       "A,%s,GW,%d,%s,%d,%s,%s,%d,%c,%d,%d,%d,%lu",
+                       "A,%s,%d,%s,%d,%c,%c,%d,%c,%d,%d,%d,%lu",
                        NODE_SHORT,
                        MAX_HOP,
                        cmd_id,
                        success ? 1 : 0,
-                       errorCode,
-                       message,
+                       errCode,
+                       msgCode,
                        pumpShort,
                        modeShort,
                        flowShort,
@@ -1337,7 +1337,7 @@ next_packet:
 
   /* ================= AUTO MODE ================= */
 
-  if (strcmp(mode, "SEN") == 0) {
+  if (mode[0] == 'S') {
 
     if (cachedSoil < 30 && !pumpStatus) {
 
@@ -1402,7 +1402,7 @@ next_packet:
                MAX_HOP,
                packetSeq,
                pumpStatus ? 1 : 0,
-               mode,
+               mode[0],
                uptime,
                (int)(default_amp * 10),
                (int)(default_flow * 10),

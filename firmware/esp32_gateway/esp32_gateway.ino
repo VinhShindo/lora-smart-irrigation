@@ -321,13 +321,19 @@ void cmdTask(void* p) {
 
       char loraCmd[128];
 
+      char nodeShort[4];
+      sscanf(item.node, "NODE_%3s", nodeShort);
+
+      int action = strcmp(item.cmd, "ON") == 0 ? 1 : strcmp(item.cmd, "OFF") == 0 ? 0
+                                                                                  : 2;  // AUTO
+
       snprintf(
         loraCmd,
         sizeof(loraCmd),
-        "C,GW,%s,3,%s,%s",
-        item.node,
+        "C,GW,%s,3,%s,%d",
+        nodeShort,
         item.cid,
-        item.cmd);
+        action);
 
       if (xSemaphoreTake(loraMutex, portMAX_DELAY)) {
 
@@ -662,9 +668,9 @@ void core0Task(void* p) {
 
         ack["type"] = "ACK";
         ack["node_id"] = nodeId;
-        ack["cmd_id"] = v[4];
+        ack["cmd_id"] = v[3];
 
-        if (waitingAck && strcmp(v[4], lastCmdId) == 0) {
+        if (waitingAck && strcmp(v[3], lastCmdId) == 0) {
 
           waitingAck = false;
           ackTimeout = 0;
@@ -672,21 +678,29 @@ void core0Task(void* p) {
           Serial.println("[ACK MATCHED]");
         }
 
-        ack["success"] = (strcmp(v[5], "1") == 0);
+        ack["success"] = (strcmp(v[4], "1") == 0);
 
-        if (idx > 6) ack["message"] = v[6];
-        if (idx > 7) ack["pump"] = v[7];
+        char err = v[5][0];
+        char msg = v[6][0];
+
+        if (err == 'N') ack["error"] = "NONE";
+        if (err == 'I') ack["error"] = "INVALID";
+
+        if (msg == 'O') ack["message"] = "OK";
+        if (msg == 'F') ack["message"] = "FAIL";
+
+        if (idx > 7) ack["pump"] = atoi(v[7]);
         if (idx > 8) ack["mode"] = v[8];
         if (idx > 9) ack["flow"] = atof(v[9]);
         if (idx > 10) ack["amp"] = atof(v[10]);
-        if (idx > 11) ack["last_soil"] = atof(v[11]);
+        if (idx > 11) ack["last_soil"] = atoi(v[11]);
+        if (idx > 12) ack["node_exec_ms"] = atol(v[12]);
 
         ack["executed_at"] = getTimeISO();
         ack["gateway_time"] = getTimeISO();
         ack["rssi"] = rssi;
 
         char out[512];
-
         serializeJson(ack, out);
 
         if (mqtt.connected()) {
@@ -694,7 +708,6 @@ void core0Task(void* p) {
         }
 
         Serial.println("[ACK RX]");
-
         continue;
       }
 
