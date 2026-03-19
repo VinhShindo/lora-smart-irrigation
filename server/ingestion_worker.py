@@ -163,13 +163,14 @@ def handle_operating_status(data: dict):
                     "updated_at": payload["updated_at"]
                 })
             )
-
+        pump_id = node_id.split('_')[1]
+        component_id = f"{node_id}_PUMP_{pump_id}"
         redis_safe_call(
             rds.lpush,
             "queue:db:device_status",
             json.dumps({
                 "type": "DEVICE_STATUS",
-                "component_id": f"{node_id}_PUMP_01",
+                "component_id": component_id,
                 "node_id": node_id,
                 "component_type": "PUMP",
                 "current_status": payload["pump"],
@@ -204,22 +205,28 @@ def handle_command_ack(data: dict):
         redis_safe_call(rds.delete, f"cmd:pending:{cmd_id}")
         redis_safe_call(rds.delete, f"node:pending:{node_id}")
 
+        mode_short = data.get("mode")
+        mode = MODE_MAP.get(mode_short, "UNKNOWN")
+
         ack_payload = {
             "type": "ACK",
             "node_id": node_id,
             "cmd_id": cmd_id,
 
-            # Kết quả thực thi
-            "success": data.get("success", True),  # True / False
-            "error_code": data.get("error_code"),  # VD: RELAY_FAIL, LOW_VOLT
-            "message": data.get("message"),        # Thông báo chi tiết
+            # Kết quả
+            "success": data.get("success", True),
+            "error_code": data.get("error"),
+            "message": None,
 
-            # Trạng thái thiết bị sau khi thực thi
-            "pump": data.get("pump"),
-            "mode": data.get("mode"),
+            # Device state
+            "pump": "ON" if data.get("pump") == 1 else "OFF",
+            "mode": mode,
             "flow": safe_float(data.get("flow")),
             "amp": safe_float(data.get("amp")),
             "last_soil": safe_float(data.get("last_soil")),
+
+            # Performance
+            "node_exec_ms": safe_int(data.get("node_exec_ms")),
 
             # Metadata
             "executed_at": data.get("executed_at"),
@@ -237,21 +244,29 @@ def handle_command_ack(data: dict):
             "queue:db:command_history",
             json.dumps({
                 "cmd_id": cmd_id,
+                "node_id": node_id,
                 "status": "SUCCESS" if ack_payload["success"] else "FAILED",
                 "success": ack_payload["success"],
                 "error_code": ack_payload.get("error_code"),
-                "message": ack_payload.get("message"),
+
+                "pump": ack_payload.get("pump"),
+                "mode": ack_payload.get("mode"),
+                "flow": ack_payload.get("flow"),
+                "amp": ack_payload.get("amp"),
+                "last_soil": ack_payload.get("last_soil"),
+
                 "executed_at": ack_payload.get("executed_at"),
                 "server_time": ack_payload["server_time"]
             })
         )
-
+        pump_id = node_id.split('_')[1]
+        component_id = f"{node_id}_PUMP_{pump_id}"
         redis_safe_call(
             rds.lpush,
             "queue:db:device_status",
             json.dumps({
                 "type": "DEVICE_STATUS",
-                "component_id": f"{node_id}_PUMP_01",
+                "component_id": component_id,
                 "node_id": node_id,
                 "component_type": "PUMP",
                 "current_status": data.get("pump"),

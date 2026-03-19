@@ -64,7 +64,7 @@ unsigned long lastSensorSend = 0;
 unsigned long lastAckTime = 0;
 unsigned long lastSoilRead = 0;
 unsigned long lastGatewaySeen = 0;
-#define PACKET_CACHE 256
+#define PACKET_CACHE 128
 struct PacketCacheItem {
   uint32_t id;
   uint32_t time;
@@ -161,11 +161,16 @@ struct CmdExecItem {
   uint16_t seq;
   char cmd_id[32];
   char target[4];
+  char src[4];
   unsigned long time;
 };
 
 CmdExecItem cmdExecCache[CMD_EXEC_CACHE];
 int cmdExecIndex = 0;
+
+bool ackWindowActive = false;
+unsigned long ackWindowStart = 0;
+const unsigned long ACK_WINDOW_TIME = 1200;  // ms
 
 //  LORA INIT
 void initLoRa() {
@@ -233,6 +238,9 @@ bool dropOldestNormal() {
 
 bool pushTx(const char* data, TxType type) {
   if (!loraReady) return false;
+  // if (ackWindowActive && isLeader && type != TX_ACK) {
+  //   return false;
+  // }
   if (type == TX_CMD || type == TX_ACK) {
     int next = (cmdTail + 1) % CMD_QUEUE_SIZE;
     if (next == cmdHead) {
@@ -265,6 +273,9 @@ bool pushTx(const char* data, TxType type) {
 
 void handleTxQueue() {
   if (!loraReady) return;
+  if (ackWindowActive && isLeader) {
+    return;
+  }
   static unsigned long lastTx = 0;
   if (millis() - lastTx < 20) return;
   TxItem item;
@@ -281,6 +292,11 @@ void handleTxQueue() {
   LoRa.beginPacket();
   LoRa.print(item.data);
   LoRa.endPacket();
+  if (item.type == TX_CMD && isLeader) {
+    ackWindowActive = true;
+    ackWindowStart = millis();
+    Serial.println("[ACK WINDOW] OPEN");
+  }
   delay(8);
   LoRa.receive();
   lastTx = millis();
@@ -288,7 +304,7 @@ void handleTxQueue() {
 
 void flushSensorBatch() {
   if (sensorCount == 0) return;
-  
+
   char packet[320];
   int offset = 0;
   offset += sprintf(packet, "BS,");
@@ -312,7 +328,7 @@ void flushSensorBatch() {
 
 void flushStatusBatch() {
   if (statusCount == 0) return;
-  
+
   char packet[320];
   int offset = 0;
   offset += sprintf(packet, "BT,");
@@ -432,7 +448,7 @@ int getActiveNodeCount() {
 }
 
 bool isSensorBatchComplete() {
-  int expected = getActiveNodeCount();
+  int expected = max(1, getActiveNodeCount());
   bool leaderFound = false;
   for (int i = 0; i < sensorCount; i++) {
     if (strcmp(sensorBuf[i].node, NODE_SHORT) == 0) {
@@ -445,7 +461,7 @@ bool isSensorBatchComplete() {
 }
 
 bool isStatusBatchComplete() {
-  int expected = getActiveNodeCount();
+  int expected = max(1, getActiveNodeCount());
   bool leaderFound = false;
   for (int i = 0; i < statusCount; i++) {
     if (strcmp(statusBuf[i].node, NODE_SHORT) == 0) {
@@ -567,19 +583,52 @@ void electLeader() {
   Serial.println(isLeader ? "YES" : "NO");
 }
 
-uint32_t hashPacket(const char* pkt) {
-  uint32_t h = 5381;
-  int c;
-  while ((c = *pkt++)) {
-    h = ((h << 5) + h) + c;
+uint32_t hashIdentity(const char* pkt) {
+  char type = pkt[0];
+  uint32_t h = 2166136261UL;  // FNV offset
+  auto hashAdd = [&](const char* s) {
+    while (*s) {
+      h ^= (uint8_t)*s++;
+      h *= 16777619;
+    }
+  };
+  char src[4], dest[4], cmd_id[32], node_id[4];
+  uint16_t seq;
+  if (type == 'D' || type == 'S') {
+    if (sscanf(pkt, "%*c,%3[^,],%*[^,],%*d,%hu", src, &seq) == 2) {
+      hashAdd(src);
+      h ^= seq;
+    }
+  } else if (type == 'C') {
+    if (sscanf(pkt, "%*c,%*[^,],%*[^,],%*d,%hu,%31[^,],%3[^,]", &seq, cmd_id, node_id) == 3) {
+      h ^= seq;
+      hashAdd(cmd_id);
+      hashAdd(node_id);
+    }
+  } else if (type == 'A') {
+    char src[4], dest[4];
+    if (sscanf(pkt, "A,%3[^,],%3[^,],%*d,%hu,%31[^,],%3[^,]",
+               src, dest, &seq, cmd_id, node_id)
+        == 5) {
+      hashAdd(src);
+      hashAdd(dest);
+      h ^= seq;
+      hashAdd(cmd_id);
+      hashAdd(node_id);
+    }
+  } else {
+    hashAdd(pkt);
   }
   return h;
 }
 
 bool packetSeen(const char* pkt) {
   if (pkt == NULL || pkt[0] == '\0') return true;
-  if (pkt[0] == 'A') return false;
-  uint32_t id = hashPacket(pkt);
+  char type = pkt[0];
+  if (type == 'H' || type == 'R' || type == 'M' || type == 'B') {
+    return false;
+  }
+  uint32_t id = hashIdentity(pkt);
   uint32_t now = millis();
   for (int i = 0; i < PACKET_CACHE; i++) {
     if (packetCache[i].id == id && (now - packetCache[i].time) < 700) {
@@ -626,6 +675,8 @@ void forwardCmdToNode(const char* pkt) {
     action);
 
   pushTx(fwd, TX_CMD);
+  ackWindowActive = true;
+  ackWindowStart = millis();
   Serial.print("[CMD][LEADER->NODE] ");
   Serial.println(fwd);
 }
@@ -643,7 +694,7 @@ void executeCmd(const char* pkt) {
     Serial.println("[CMD] malformed");
     return;
   }
-  if (cmdExecuted(seq, cmd_id, target)) {
+  if (cmdExecuted(seq, cmd_id, target, src)) {
     Serial.println("[CMD] duplicate EXECUTE blocked");
     return;
   }
@@ -689,7 +740,11 @@ void executeCmd(const char* pkt) {
     (int)(default_flow * 10),
     (int)(default_amp * 10),
     soil_now);
-
+  if (!isLeader) {
+    if (ackWindowActive) {
+      delay(random(50, 120));
+    }
+  }
   pushTx(ack, TX_ACK);
   Serial.print("[CMD][ACK->LEADER] ");
   Serial.println(ack);
@@ -726,6 +781,8 @@ void handleAckAtLeader(const char* pkt) {
     Serial.println("[ACK] malformed");
     return;
   }
+  updateLastSeen(node_id);
+  updateLastSeen(src);
   if (strcmp(dest, "LD") != 0) return;
   hop--;
   if (hop <= 0) return;
@@ -750,21 +807,23 @@ void handleAckAtLeader(const char* pkt) {
   Serial.println(fwd);
 }
 
-bool cmdExecuted(uint16_t seq, const char* cmd_id, const char* target) {
+bool cmdExecuted(uint16_t seq, const char* cmd_id, const char* target, const char* src) {
   unsigned long now = millis();
+
   for (int i = 0; i < CMD_EXEC_CACHE; i++) {
-    if (cmdExecCache[i].seq == seq && strcmp(cmdExecCache[i].cmd_id, cmd_id) == 0 && strcmp(cmdExecCache[i].target, target) == 0 && (now - cmdExecCache[i].time) < 10000) {
+    if (cmdExecCache[i].seq == seq && strcmp(cmdExecCache[i].cmd_id, cmd_id) == 0 && strcmp(cmdExecCache[i].target, target) == 0 && strcmp(cmdExecCache[i].src, src) == 0 && (now - cmdExecCache[i].time) < 10000) {
       return true;
     }
   }
   cmdExecCache[cmdExecIndex].seq = seq;
   strcpy(cmdExecCache[cmdExecIndex].cmd_id, cmd_id);
   strcpy(cmdExecCache[cmdExecIndex].target, target);
+  strcpy(cmdExecCache[cmdExecIndex].src, src);
   cmdExecCache[cmdExecIndex].time = now;
+
   cmdExecIndex = (cmdExecIndex + 1) % CMD_EXEC_CACHE;
   return false;
 }
-
 void setup() {
   Serial.begin(115200);
   Serial.println("\n[NODE] Đang khởi động...");
@@ -806,6 +865,11 @@ void loop() {
         }
         char* pkt = start;
         char type = pkt[0];
+        if (ackWindowActive && isLeader) {
+          if (type != 'A') {
+            goto next_packet;
+          }
+        }
         if (packetSeen(pkt)) {
           Serial.println("[DROP] duplicate packet");
           goto next_packet;
@@ -815,7 +879,6 @@ void loop() {
           goto next_packet;
         }
 
-        /* ===== ACK PRIORITY ===== */
         /* ===== ACK PRIORITY ===== */
         if (type == 'A') {
           char src[4], dest[4], cmd_id[32], node_id[4];
@@ -838,9 +901,16 @@ void loop() {
             goto next_packet;
           }
           lastAckTime = millis();
+          if (isLeader && ackWindowActive) {
+            ackWindowActive = false;
+            Serial.println("[ACK WINDOW] CLOSED (ACK RECEIVED)");
+          }
           if (hop <= 1) {
             Serial.println("[ACK] hop exhausted");
             goto next_packet;
+          }
+          if (strcmp(src, "LD") == 0) {
+            lastLeaderSeen = millis();
           }
           if (isLeader) {
             handleAckAtLeader(pkt);
@@ -908,6 +978,7 @@ void loop() {
           /* ===== Leader receive from GW ===== */
           if (strcmp(dest, "LD") == 0 && isLeader) {
             Serial.println("[CMD] GW -> LEADER");
+            lastGatewaySeen = millis();
             /* ===== CMD for leader itself ===== */
             if (strcmp(target, NODE_SHORT) == 0) {
               Serial.println("[CMD] Leader executing self command");
@@ -925,6 +996,7 @@ void loop() {
               goto next_packet;
             }
             Serial.println("[CMD] NODE EXECUTE");
+            lastLeaderSeen = millis();
             executeCmd(pkt);
             goto next_packet;
           }
@@ -1044,7 +1116,7 @@ void loop() {
           if (sscanf(pkt, "HL,%3[^,\r\n]", leader) == 1) {
             if (strcmp(leader, leaderId) == 0) {
               lastLeaderSeen = millis();
-              updateLastSeen(node);
+              updateLastSeen(leaderId);
               Serial.println("[HB] Leader alive");
             }
           }
@@ -1188,6 +1260,10 @@ next_packet:
           break;
         start = sep + 1;
       }
+    }
+    if (ackWindowActive && millis() - ackWindowStart > ACK_WINDOW_TIME) {
+      ackWindowActive = false;
+      Serial.println("[ACK WINDOW] CLOSED");
     }
 
     if (isLeader && cmdHead == cmdTail) {

@@ -361,7 +361,7 @@
         function getStatusEl(nodeId) {
             return nodeControlState[nodeId]?.statusEl;
         }
-        
+
         function setState(nodeId, newState) {
             nodeControlState[nodeId].state = newState;
         }
@@ -507,15 +507,19 @@
             const nodeId = data.node_id;
             const el = document.getElementById(nodeId);
             if (!el) return;
-
             if (data.cmd_id !== getCmd(nodeId)) return;
-
-            setState(nodeId, "EXECUTING");
-
-            const statusMsg = getStatusEl(nodeId);;
+            const statusMsg = getStatusEl(nodeId);
             if (!statusMsg) return;
-            statusMsg.innerText = "EXECUTING...";
-            statusMsg.className = "status-msg status-executing";
+
+            if (data.queue_pos && data.queue_pos > 1) {
+                setState(nodeId, "QUEUED");
+                statusMsg.innerText = "ĐANG XẾP HÀNG (#" + data.queue_pos + ")";
+                statusMsg.className = "status-msg status-waiting";
+            } else {
+                setState(nodeId, "EXECUTING");
+                statusMsg.innerText = "EXECUTING...";
+                statusMsg.className = "status-msg status-executing";
+            }
         });
 
         socket.on("node_ack", data => {

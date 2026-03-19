@@ -12,7 +12,7 @@ from flask import request
 
 REDIS_HOST = "127.0.0.1"
 REDIS_PORT = 6379
-MQTT_BROKER = "localhost"
+MQTT_BROKER = "192.168.0.105"
 
 SUPABASE_URL = "https://kbfclhdcnttemiwxsezf.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtiZmNsaGRjbnR0ZW1pd3hzZXpmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg4OTU0MzIsImV4cCI6MjA4NDQ3MTQzMn0.mjSevT2RwvHX3hHJLwru0YqkfPxvWOgzcvmOkpBWqbA" # Thay bằng Project API anon key của bạn
@@ -83,20 +83,25 @@ def listen_to_redis_events():
 def check_timeout():
     while True:
         time.sleep(5)
+        try:
+            for key in rds.scan_iter("cmd:pending:*"):
+                data = rds.get(key)
+                if not data:
+                    continue
 
-        pending = supabase.table("command_history") \
-            .select("cmd_id") \
-            .eq("status", "PENDING") \
-            .execute()
+                payload = json.loads(data)
+                cmd_id = key.split(":")[2]
+                ttl = rds.ttl(key)
 
-        for cmd in pending.data:
-            cmd_id = cmd["cmd_id"]
-
-            if not rds.exists(f"cmd:pending:{cmd_id}"):
-                supabase.table("command_history") \
-                    .update({"status": "TIMEOUT"}) \
-                    .eq("cmd_id", cmd_id) \
-                    .execute()
+                if ttl <= 0:
+                    print(f"[TIMEOUT] {cmd_id}")
+                    supabase.table("command_history") \
+                        .update({"status": "TIMEOUT"}) \
+                        .eq("cmd_id", cmd_id) \
+                        .execute()
+                    rds.delete(key)
+        except Exception as e:
+            print("[TIMEOUT ERROR]", e)
 
 socketio.start_background_task(check_timeout)
 socketio.start_background_task(listen_to_redis_events)
@@ -122,6 +127,7 @@ def handle_subscribe(data):
 
 @socketio.on("control")
 def handle_control(data):
+
     node_id = data.get("node_id")
     action = data.get("action")
 
@@ -129,23 +135,23 @@ def handle_control(data):
         return
 
     cmd_id = data.get("cmd_id") or str(uuid.uuid4())
-    component_id = f"{node_id}_PUMP_01"
 
-    supabase.table("command_history").insert({
-        "cmd_id": cmd_id,
-        "node_id": node_id,
-        "component_id": component_id,
-        "command": action,
-        "trigger_source": "CLOUD",
-        "status": "PENDING",
-        "sent_at": now_iso(),
-        "retry_count": 0
-    }).execute()
+    pump_id = node_id.split('_')[1]
+    component_id = f"{node_id}_PUMP_{pump_id}"
 
-    emit("node_pending", {
-        "node_id": node_id,
-        "cmd_id": cmd_id
-    }, to=request.sid)
+    try:
+        supabase.table("command_history").insert({
+            "cmd_id": cmd_id,
+            "node_id": node_id,
+            "component_id": component_id,
+            "command": action,
+            "trigger_source": "CLOUD",
+            "status": "PENDING",
+            "sent_at": now_iso(),
+            "retry_count": 0
+        }).execute()
+    except Exception as e:
+        print("DB ERROR:", e)
 
     mqtt_payload = {
         "cmd_id": cmd_id,
@@ -155,22 +161,77 @@ def handle_control(data):
         "source": "WEB",
         "ts": now_iso()
     }
-    
-    rds.set(f"node:pending:{node_id}", cmd_id, ex=20)
-    rds.set(
-        f"cmd:pending:{cmd_id}",
-        json.dumps({
-            "node_id": node_id,
-            "created_at": now_iso()
-        }),
-        ex=20
+
+    # enqueue command
+    rds.lpush(
+        "queue:cmd",
+        json.dumps(mqtt_payload)
     )
 
-    mqtt_client.publish(
-        f"garden/control/{node_id}/cmd",
-        json.dumps(mqtt_payload),
-        qos=1
-    )
+    queue_size = rds.llen("queue:cmd")
+
+    emit("node_pending", {
+        "node_id": node_id,
+        "cmd_id": cmd_id,
+        "queue_pos": queue_size
+    }, to=request.sid)
+
+def cmd_worker():
+
+    CMD_DELAY = 1.2
+
+    print("[CMD] Worker started")
+
+    while True:
+
+        try:
+
+            item = rds.brpop("queue:cmd", timeout=5)
+
+            if not item:
+                continue
+
+            data = json.loads(item[1])
+
+            node_id = data["node_id"]
+            cmd_id = data["cmd_id"]
+
+            # CHECK NODE BUSY
+            if rds.exists(f"node:pending:{node_id}"):
+                print(f"[CMD] {node_id} busy -> requeue")
+                rds.lpush("queue:cmd", json.dumps(data))
+                time.sleep(1)
+                continue
+
+            print(f"[CMD] SEND {cmd_id} -> {node_id}")
+
+            # SET pending (chuyển từ handle_control sang đây)
+            rds.set(
+                f"node:pending:{node_id}",
+                cmd_id,
+                ex=20
+            )
+
+            rds.set(
+                f"cmd:pending:{cmd_id}",
+                json.dumps({
+                    "node_id": node_id,
+                    "created_at": now_iso()
+                }),
+                ex=20
+            )
+
+            mqtt_client.publish(
+                f"garden/control/{node_id}/cmd",
+                json.dumps(data),
+                qos=1
+            )
+
+            time.sleep(CMD_DELAY)
+
+        except Exception as e:
+            print("[CMD WORKER ERROR]", e)
+            time.sleep(2)
 
 @app.route("/api/node/<node_id>/measurements")
 def get_measurements_api(node_id):
@@ -188,4 +249,5 @@ def get_measurements_api(node_id):
         return jsonify([])
 
 if __name__ == "__main__":
+    socketio.start_background_task(cmd_worker)
     socketio.run(app, host="0.0.0.0", port=8080, debug=False)

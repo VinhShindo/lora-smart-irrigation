@@ -72,7 +72,7 @@ while True:
                 print("[MEASUREMENT][DROP]", e)
 
         if batch:
-            # supabase.table("measurements").insert(batch).execute()
+            supabase.table("measurements").insert(batch).execute()
             print(f"[DB] Inserted {len(batch)} measurements")
 
         # ==================================================
