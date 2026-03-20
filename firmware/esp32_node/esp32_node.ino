@@ -132,8 +132,8 @@ int statusCount = 0;
 unsigned long lastSensorUpdate = 0;
 unsigned long lastStatusUpdate = 0;
 
-const unsigned long SENSOR_TIMEOUT = 30000;  // timeout riêng
-const unsigned long STATUS_TIMEOUT = 10000;
+const unsigned long SENSOR_TIMEOUT = 40000;  // timeout riêng
+const unsigned long STATUS_TIMEOUT = 20000;
 
 //  MESH STATE
 MeshNode meshTable[MAX_MESH_NODE];
@@ -175,7 +175,7 @@ int cmdExecIndex = 0;
 
 bool ackWindowActive = false;
 unsigned long ackWindowStart = 0;
-const unsigned long ACK_WINDOW_TIME = 2000;  // ms
+const unsigned long ACK_WINDOW_TIME = 5000;  // ms
 
 //  LORA INIT
 void initLoRa() {
@@ -293,7 +293,7 @@ void handleTxQueue() {
     normHead = (normHead + 1) % NORMAL_QUEUE_SIZE;
   }
   LoRa.idle();
-  delay(3);
+  delay(random(5, 30));
   LoRa.beginPacket();
   LoRa.print(item.data);
   LoRa.endPacket();
@@ -679,8 +679,8 @@ void forwardCmdToNode(const char* pkt) {
     action);
 
   pushTx(fwd, TX_CMD);
-  ackWindowActive = true;
-  ackWindowStart = millis();
+  // ackWindowActive = true;
+  // ackWindowStart = millis();
   Serial.print("[CMD][LEADER->NODE] ");
   Serial.println(fwd);
 }
@@ -870,11 +870,11 @@ void loop() {
         }
         char* pkt = start;
         char type = pkt[0];
-        if (ackWindowActive && isLeader) {
-          if (type != 'A') {
-            goto next_packet;
-          }
-        }
+        // if (ackWindowActive && isLeader) {
+        //   if (type != 'A') {
+        //     goto next_packet;
+        //   }
+        // }
         if (packetSeen(pkt)) {
           Serial.println("[DROP] duplicate packet");
           goto next_packet;
@@ -1328,7 +1328,7 @@ next_packet:
     digitalWrite(PIN_RELAY, pumpStatus ? LOW : HIGH);
 
     /* ================= STATUS SEND ================= */
-    if (nodeState == NODE_NETWORK_READY && cmdHead == cmdTail && millis() - lastStatusSend > STATUS_INTERVAL + random(0, 1000) && millis() - lastAckTime > STATUS_INTERVAL) {
+    if (nodeState == NODE_NETWORK_READY && cmdHead == cmdTail && millis() - lastStatusSend > STATUS_INTERVAL + random(0, 2000) && millis() - lastAckTime > STATUS_INTERVAL) {
       lastStatusSend = millis();
       unsigned long uptime = (millis() - bootTime) / 1000;
       if (isLeader) {
@@ -1378,7 +1378,7 @@ next_packet:
     }
 
     /* ================= SENSOR SEND ================= */
-    if (nodeState == NODE_NETWORK_READY && cmdHead == cmdTail && millis() - lastSensorSend > SENSOR_INTERVAL + random(0, 3000) && millis() - lastAckTime > SENSOR_INTERVAL + random(0, 3000)) {
+    if (nodeState == NODE_NETWORK_READY && cmdHead == cmdTail && millis() - lastSensorSend > SENSOR_INTERVAL + random(4000, 10000) && millis() - lastAckTime > SENSOR_INTERVAL + random(0, 3000)) {
       lastSensorSend = millis();
       Serial.print("[ROUTE] Sensor route: ");
       Serial.print(NODE_SHORT);
