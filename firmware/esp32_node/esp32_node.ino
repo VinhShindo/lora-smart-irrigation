@@ -833,7 +833,8 @@ void setup() {
   Serial.println("\n[NODE] Đang khởi động...");
   dht.begin();
   pinMode(PIN_RELAY, OUTPUT);
-  digitalWrite(PIN_RELAY, LOW);
+  pumpStatus = false; 
+  digitalWrite(PIN_RELAY, HIGH);
   Serial.println("[BOOT] Relay: TẮT | READY");
   bootTime = millis();
   lastGatewaySeen = millis();
