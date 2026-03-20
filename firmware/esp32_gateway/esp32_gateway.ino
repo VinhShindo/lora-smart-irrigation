@@ -6,6 +6,8 @@
 #include <map>
 #include <set>
 #include "time.h"
+#include <WebServer.h>
+#include <Preferences.h>
 
 // LORA
 #define LORA_SS 5
@@ -22,6 +24,31 @@ const char* API_URL = "http://192.168.0.105:5000/api/batch";
 
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
+
+// --- BIẾN CẤU HÌNH WIFI MỚI ---
+WebServer server(80);
+Preferences preferences;
+
+const char* DEFAULT_SSID = "Garden_Gateway_Config";
+const char* DEFAULT_PASS = "12345678";
+
+// Biến lưu thông tin WiFi tạm thời từ Preferences
+String st_ssid = "";
+String st_pass = "";
+
+// HTML cho trang cấu hình
+const char html_page[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html>
+<head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Gateway Config</title></head>
+<body>
+  <h2>Cấu hình WiFi cho Gateway</h2>
+  <form action="/save" method="POST">
+    SSID: <br><input type="text" name="ssid"><br>
+    Password: <br><input type="password" name="pass"><br><br>
+    <input type="submit" value="Lưu và Khởi động lại">
+  </form>
+</body></html>
+)rawliteral";
 
 // LORA STATE
 bool loraReady = false;
@@ -69,6 +96,44 @@ SemaphoreHandle_t loraMutex;
 // HEARTBEAT
 unsigned long lastHeartbeatSent = 0;
 const unsigned long HEARTBEAT_INTERVAL = 25000;
+
+bool apModeActive = false;
+
+void handleSave() {
+  String n_ssid = server.arg("ssid");
+  String n_pass = server.arg("pass");
+  if (n_ssid.length() > 0) {
+    preferences.begin("wifi-config", false);
+    preferences.putString("ssid", n_ssid);
+    preferences.putString("pass", n_pass);
+    preferences.end();
+    server.send(200, "text/html", "<h1>Da luu! Gateway dang khoi dong lai...</h1>");
+    delay(2000);
+    apModeActive = false;
+    st_ssid = n_ssid;
+    st_pass = n_pass;
+    ESP.restart();
+  } else {
+    server.send(400, "text/html", "<h1>SSID khong hop le!</h1>");
+  }
+}
+
+// Hàm khởi chạy trang Web cấu hình (Chế độ AP)
+void startConfigPortal() {
+  if (apModeActive) return;
+  apModeActive = true;
+  mqtt.disconnect();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(DEFAULT_SSID, DEFAULT_PASS);
+  Serial.println("[WIFI] AP MODE");
+  Serial.println(WiFi.softAPIP());
+  server.on("/", []() {
+    server.send(200, "text/html", html_page);
+  });
+  server.on("/save", HTTP_POST, handleSave);
+  server.begin();
+}
 
 // TIME
 String getTimeISO() {
@@ -123,17 +188,34 @@ void initLoRa() {
 
 // WIFI RECONNECT
 void wifiReconnect() {
+  if (apModeActive) return;
   static unsigned long lastTry = 0;
-  if (WiFi.status() == WL_CONNECTED) return;
-  if (millis() - lastTry < 5000) return;
+  static unsigned long firstFail = 0;
+  if (st_ssid.length() == 0) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (apModeActive) {
+      Serial.println("[WIFI] Connected → disable AP");
+      WiFi.softAPdisconnect(true);
+      apModeActive = false;
+    }
+    firstFail = 0;
+    return;
+  }
+  ntpReady = false;
+  if (firstFail == 0) firstFail = millis();
+  if (millis() - firstFail > 60000) {
+    Serial.println("[WIFI] Lost too long → start config portal");
+    startConfigPortal();
+    return;
+  }
+  if (millis() - lastTry < 10000) return;
   lastTry = millis();
-  Serial.println("[WIFI] Reconnect");
-  WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(st_ssid.c_str(), st_pass.c_str());
 }
 
 // MQTT RECONNECT
 void mqttReconnect() {
+  if (apModeActive) return;
   static unsigned long lastTry = 0;
   if (mqtt.connected()) return;
   if (WiFi.status() != WL_CONNECTED) return;
@@ -243,6 +325,15 @@ void cmdTask(void* p) {
   }
 }
 
+void webTask(void* p) {
+  for (;;) {
+    if (apModeActive) {
+      server.handleClient();
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
 // LORA RX TASK
 void loraRxTask(void* p) {
   Serial.println("[CORE] LORA TASK started");
@@ -261,6 +352,22 @@ void loraRxTask(void* p) {
         Serial.println("[NTP] OK");
       } else {
         Serial.println("[NTP] Sync fail");
+      }
+    }
+    // HEARTBEAT (SMART PRIORITY)
+    if (loraReady && millis() - lastHeartbeatSent > HEARTBEAT_INTERVAL) {
+      if (xSemaphoreTake(loraMutex, pdMS_TO_TICKS(100))) {
+        LoRa.idle();
+        delay(3);
+        while (LoRa.available()) LoRa.read();
+        delay(2);
+        LoRa.beginPacket();
+        LoRa.print("B,L");
+        LoRa.endPacket();
+        LoRa.receive();
+        Serial.println("[GW][TX] HEARTBEAT");
+        lastHeartbeatSent = millis();
+        xSemaphoreGive(loraMutex);
       }
     }
 
@@ -317,7 +424,7 @@ void loraRxTask(void* p) {
       if (strncmp(buf, "BS,", 3) == 0) {
         Serial.println("[GW] SENSOR BATCH RX");
         char* record = buf + 3;
-        char* entry = strtok(record, ";");
+        char* entry = strtok(record, "|");
         while (entry) {
           char node[4];
           float t, h, soil, light;
@@ -349,7 +456,7 @@ void loraRxTask(void* p) {
       if (strncmp(buf, "BT,", 3) == 0) {
         Serial.println("[GW] STATUS BATCH RX");
         char* record = buf + 3;
-        char* entry = strtok(record, ";");
+        char* entry = strtok(record, "|");
         while (entry) {
           char node[4];
           int pump;
@@ -357,7 +464,10 @@ void loraRxTask(void* p) {
           int soil;
           float amp;
           float flow;
-          if (sscanf(entry, "%3[^,],%d,%c,%d,%f,%f", node, &pump, &mode, &soil, &amp, &flow) >= 4) {
+          int nodeRssi = -200;
+          if (sscanf(entry, "%3[^,],%d,%c,%d,%f,%f,%d",
+                     node, &pump, &mode, &soil, &amp, &flow, &nodeRssi)
+              == 7) {
             if (!validShortNode(node)) {
               Serial.println("[SECURITY] invalid node in BT");
               entry = strtok(NULL, ";");
@@ -374,7 +484,11 @@ void loraRxTask(void* p) {
             status["last_soil"] = soil;
             status["amp"] = amp;
             status["flow"] = flow;
-            status["rssi"] = rssi;
+            int finalRssi = nodeRssi;
+            if (nodeRssi == -200) {
+              finalRssi = rssi;
+            }
+            status["rssi"] = finalRssi;
             status["current_status"] = "ONLINE";
             status["gateway_time"] = getTimeISO();
             char msg[512];
@@ -383,7 +497,7 @@ void loraRxTask(void* p) {
               mqtt.publish("garden/status", msg);
             }
             nodeRegistry[nodeId].lastSeen = millis();
-            nodeRegistry[nodeId].rssi = rssi;
+            nodeRegistry[nodeId].rssi = finalRssi;
             nodeRegistry[nodeId].online = true;
             Serial.printf("[BATCH STATUS] %s\n", node);
           }
@@ -462,22 +576,6 @@ void loraRxTask(void* p) {
         continue;
       }
       Serial.println("[LORA] UNKNOWN PACKET");
-    }
-
-    // HEARTBEAT
-    if (loraReady && millis() - lastHeartbeatSent > HEARTBEAT_INTERVAL && xSemaphoreTake(loraMutex, 0)) {
-      LoRa.idle();
-      delay(2);
-      LoRa.beginPacket();
-      if (loraReady) {
-        char hb[16];
-        snprintf(hb, sizeof(hb), "B,L");
-        LoRa.print(hb);
-      }
-      LoRa.endPacket();
-      LoRa.receive();
-      lastHeartbeatSent = millis();
-      xSemaphoreGive(loraMutex);
     }
 
     if (!loraReady && millis() - lastLoRaRetry > 10000) {
@@ -586,32 +684,67 @@ void setup() {
   Serial.begin(115200);
   mqtt.setBufferSize(1024);
   Serial.println("\n=== ESP32 GARDEN GATEWAY ===");
+  // 1. Lấy WiFi từ bộ nhớ
+  preferences.begin("wifi-config", true);
+  st_ssid = preferences.getString("ssid", "");
+  st_pass = preferences.getString("pass", "");
+  preferences.end();
+
+  // 2. Thử kết nối WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  if (st_ssid.length() > 0) {
+    WiFi.begin(st_ssid.c_str(), st_pass.c_str());
+    Serial.print("[WIFI] Đang kết nối tới: ");
+    Serial.println(st_ssid);
+
+    unsigned long start = millis();
+    bool connected = false;
+    while (millis() - start < 5000) {  // Đợi 20 giây
+      if (WiFi.status() == WL_CONNECTED) {
+        connected = true;
+        break;
+      }
+      delay(500);
+      Serial.print(".");
+    }
+
+    if (connected) {
+      Serial.println("\n[WIFI] Kết nối thành công!");
+    } else {
+      Serial.println("\n[WIFI] Thất bại! Chuyển sang chế độ Cấu hình...");
+      startConfigPortal();  // Dừng tại đây chờ người dùng nhập WiFi
+    }
+  } else {
+    Serial.println("[WIFI] Không tìm thấy WiFi đã lưu. Khởi động Portal...");
+    startConfigPortal();
+  }
   mutex = xSemaphoreCreateMutex();
   loraMutex = xSemaphoreCreateMutex();
   if (!loraMutex) {
     Serial.println("[FATAL] LoRa mutex create failed");
     esp_restart();
   }
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("[WIFI] Connecting");
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-    if (millis() - start > 20000) {
-      Serial.println("\n[WIFI] TIMEOUT");
-      break;
-    }
-  }
+  // WiFi.mode(WIFI_STA);
+  // WiFi.setSleep(false);
+  // WiFi.begin(WIFI_SSID, WIFI_PASS);
+  // Serial.print("[WIFI] Connecting");
+  // unsigned long start = millis();
+  // while (WiFi.status() != WL_CONNECTED) {
+  //   delay(500);
+  //   Serial.print(".");
+  //   if (millis() - start > 20000) {
+  //     Serial.println("\n[WIFI] TIMEOUT");
+  //     break;
+  //   }
+  // }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[WIFI] OK");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("[WIFI] FAIL");
-  }
+  // if (WiFi.status() == WL_CONNECTED) {
+  //   Serial.println("\n[WIFI] OK");
+  //   Serial.println(WiFi.localIP());
+  // } else {
+  //   Serial.println("[WIFI] FAIL");
+  // }
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
 
@@ -643,6 +776,7 @@ void setup() {
   xTaskCreatePinnedToCore(loraRxTask, "loraRx", 4096, NULL, 6, NULL, 0);
   xTaskCreatePinnedToCore(mqttTask, "mqtt", 4096, NULL, 5, NULL, 1);
   xTaskCreatePinnedToCore(httpTask, "http", 8192, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(webTask, "web", 4096, NULL, 1, NULL, 1);
 }
 
 void loop() {

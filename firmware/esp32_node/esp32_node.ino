@@ -121,14 +121,19 @@ struct LeaderStatusPacket {
   int pump;
   char mode;
   int soil;
+  int rssi;
 };
 
 LeaderSensorPacket sensorBuf[LEADER_BUF];
 LeaderStatusPacket statusBuf[LEADER_BUF];
 int sensorCount = 0;
 int statusCount = 0;
-unsigned long lastLeaderFlush = 0;
-const unsigned long LEADER_FLUSH_INTERVAL = 10000;
+
+unsigned long lastSensorUpdate = 0;
+unsigned long lastStatusUpdate = 0;
+
+const unsigned long SENSOR_TIMEOUT = 30000;  // timeout riêng
+const unsigned long STATUS_TIMEOUT = 10000;
 
 //  MESH STATE
 MeshNode meshTable[MAX_MESH_NODE];
@@ -170,7 +175,7 @@ int cmdExecIndex = 0;
 
 bool ackWindowActive = false;
 unsigned long ackWindowStart = 0;
-const unsigned long ACK_WINDOW_TIME = 1200;  // ms
+const unsigned long ACK_WINDOW_TIME = 2000;  // ms
 
 //  LORA INIT
 void initLoRa() {
@@ -310,7 +315,7 @@ void flushSensorBatch() {
   offset += sprintf(packet, "BS,");
   for (int i = 0; i < sensorCount; i++) {
     offset += sprintf(packet + offset,
-                      "%s,%.1f,%.1f,%d,%d;",
+                      "%s,%.1f,%.1f,%d,%d|",
                       sensorBuf[i].node,
                       sensorBuf[i].t,
                       sensorBuf[i].h,
@@ -323,7 +328,6 @@ void flushSensorBatch() {
   Serial.print(" -> GW | ");
   Serial.println(packet);
   sensorCount = 0;
-  lastLeaderFlush = millis();
 }
 
 void flushStatusBatch() {
@@ -333,16 +337,17 @@ void flushStatusBatch() {
   int offset = 0;
   offset += sprintf(packet, "BT,");
   for (int i = 0; i < statusCount; i++) {
-    int amp = (int)(default_amp * 10);
-    int flow = (int)(default_flow * 10);
+    float amp = (float)(default_amp * 10);
+    float flow = (float)(default_flow * 10);
     offset += sprintf(packet + offset,
-                      "%s,%d,%c,%d,%d,%d;",
+                      "%s,%d,%c,%d,%.1f,%.1f,%d|",
                       statusBuf[i].node,
                       statusBuf[i].pump,
                       statusBuf[i].mode,
                       statusBuf[i].soil,
                       amp,
-                      flow);
+                      flow,
+                      statusBuf[i].rssi);
   }
   pushTx(packet, TX_NORMAL);
   Serial.print("[TX][BATCH_STATUS] ");
@@ -350,7 +355,6 @@ void flushStatusBatch() {
   Serial.print(" -> GW | ");
   Serial.println(packet);
   statusCount = 0;
-  lastLeaderFlush = millis();
 }
 
 //  MESH FUNCTIONS
@@ -631,7 +635,7 @@ bool packetSeen(const char* pkt) {
   uint32_t id = hashIdentity(pkt);
   uint32_t now = millis();
   for (int i = 0; i < PACKET_CACHE; i++) {
-    if (packetCache[i].id == id && (now - packetCache[i].time) < 700) {
+    if (packetCache[i].id == id && (now - packetCache[i].time) < 300) {
       return true;
     }
   }
@@ -845,6 +849,7 @@ void loop() {
   if (loraReady) {
     int packetSize = LoRa.parsePacket();
     if (packetSize) {
+      int packetRssi = LoRa.packetRssi();
       char msg[128];
       int i = 0;
 
@@ -965,7 +970,7 @@ void loop() {
               Serial.println("[CMD] hop exhausted");
               goto next_packet;
             }
-            delay(random(10, 30));
+            delay(random(5, 25));
             hop--;
             char fwd[160];
             snprintf(fwd, sizeof(fwd),
@@ -1048,8 +1053,7 @@ void loop() {
           char node[4];
           if (sscanf(pkt, "HM,%3[^,\r\n]", node) == 1) {
             if (strcmp(node, NODE_SHORT) != 0) {
-              int rssi = LoRa.packetRssi();
-              updateMesh(node, rssi);
+              updateMesh(node, packetRssi);
             }
           }
         }
@@ -1116,7 +1120,6 @@ void loop() {
           if (sscanf(pkt, "HL,%3[^,\r\n]", leader) == 1) {
             if (strcmp(leader, leaderId) == 0) {
               lastLeaderSeen = millis();
-              updateLastSeen(leaderId);
               Serial.println("[HB] Leader alive");
             }
           }
@@ -1187,7 +1190,6 @@ void loop() {
               seq,
               data);
             pushTx(fwd, TX_NORMAL);
-            // Serial.println("[ROUTE] forwarding packet");
           }
           /* ===== LEADER RECEIVE ===== */
           if (isLeader && strcmp(routeSrc, NODE_SHORT) != 0 && (strcmp(routeDest, leaderId) == 0 || strcmp(routeDest, NODE_SHORT) == 0 || strcmp(routeDest, "GW") == 0)) {
@@ -1199,7 +1201,7 @@ void loop() {
                          "D,%3[^,],%*[^,],%*d,%*u,%f,%f,%d,%d",
                          nodeId, &t, &h, &soil, &light)
                   == 5) {
-                updateLastSeen(nodeId);
+                updateMesh(nodeId, packetRssi);
                 bool found = false;
                 for (int i = 0; i < sensorCount; i++) {
                   if (strcmp(sensorBuf[i].node, nodeId) == 0) {
@@ -1208,7 +1210,6 @@ void loop() {
                     sensorBuf[i].soil = soil;
                     sensorBuf[i].light = light;
                     found = true;
-                    // Serial.printf("[LEADER] sensor UPDATE %s\n", nodeId);
                     break;
                   }
                 }
@@ -1219,26 +1220,32 @@ void loop() {
                   sensorBuf[sensorCount].soil = soil;
                   sensorBuf[sensorCount].light = light;
                   sensorCount++;
-                  // Serial.printf("[LEADER] sensor NEW %s (%d)\n", nodeId, sensorCount);
                 }
+                lastSensorUpdate = millis();
               }
             } else if (type == 'S') {
               char nodeId[4];
-              int pump, soil;
+              int pump, uptime, amp, flow, soil;
               char modeChar;
               if (sscanf(pkt,
-                         "S,%3[^,],%*[^,],%*d,%*u,%d,%c,%*lu,%*d,%*d,%d",
-                         nodeId, &pump, &modeChar, &soil)
-                  == 4) {
-                updateLastSeen(nodeId);
+                         "S,%3[^,],%*[^,],%*d,%*u,%d,%c,%d,%d,%d,%d",
+                         nodeId,
+                         &pump,
+                         &modeChar,
+                         &uptime,
+                         &amp,
+                         &flow,
+                         &soil)
+                  == 7) {
+                updateMesh(nodeId, packetRssi);
                 bool found = false;
                 for (int i = 0; i < statusCount; i++) {
                   if (strcmp(statusBuf[i].node, nodeId) == 0) {
                     statusBuf[i].pump = pump;
                     statusBuf[i].mode = modeChar;
                     statusBuf[i].soil = soil;
+                    statusBuf[i].rssi = packetRssi;
                     found = true;
-                    // Serial.printf("[LEADER] status UPDATE %s\n", nodeId);
                     break;
                   }
                 }
@@ -1247,9 +1254,10 @@ void loop() {
                   statusBuf[statusCount].pump = pump;
                   statusBuf[statusCount].mode = modeChar;
                   statusBuf[statusCount].soil = soil;
+                  statusBuf[statusCount].rssi = packetRssi;
                   statusCount++;
-                  // Serial.printf("[LEADER] status NEW %s (%d)\n", nodeId, statusCount);
                 }
+                lastStatusUpdate = millis();
               }
             }
           }
@@ -1268,16 +1276,13 @@ next_packet:
 
     if (isLeader && cmdHead == cmdTail) {
       if (isSensorBatchComplete()) {
-        // Serial.println("[FLUSH] Sensor batch FULL -> send");
+        flushSensorBatch();
+      } else if (sensorCount > 0 && millis() - lastSensorUpdate > SENSOR_TIMEOUT) {
         flushSensorBatch();
       }
       if (isStatusBatchComplete()) {
-        // Serial.println("[FLUSH] Status batch FULL -> send");
         flushStatusBatch();
-      }
-      if (millis() - lastLeaderFlush > LEADER_FLUSH_INTERVAL) {
-        // Serial.println("[FLUSH] Timeout -> force send");
-        flushSensorBatch();
+      } else if (statusCount > 0 && millis() - lastStatusUpdate > STATUS_TIMEOUT) {
         flushStatusBatch();
       }
     }
@@ -1333,6 +1338,7 @@ next_packet:
             statusBuf[i].pump = pumpStatus ? 1 : 0;
             statusBuf[i].mode = mode[0];
             statusBuf[i].soil = cachedSoil;
+            statusBuf[i].rssi = -200;
             found = true;
             break;
           }
@@ -1342,6 +1348,7 @@ next_packet:
           statusBuf[statusCount].pump = pumpStatus ? 1 : 0;
           statusBuf[statusCount].mode = mode[0];
           statusBuf[statusCount].soil = cachedSoil;
+          statusBuf[statusCount].rssi = -200;
           statusCount++;
         }
       } else {
