@@ -194,19 +194,34 @@ Redis đóng vai trò **cầu nối giữa các luồng không đồng nhất**:
 ## 4. Cấu trúc thư mục
 ```
 agromesh-iot-platform/
-├── firmware/
-│ ├── esp32_node.ino
-│ └── esp32_gateway.ino
-├── server/
-│ ├── flask_app.py
-│ ├── ingestion_worker.py
-│ ├── db_worker.py
-│ └── templates/
-│ └── dashboard.html
-├── docs/
-│ └── system-diagram.png
-├── README.md
-└── CONTRIBUTING.md
+├── docs/                      
+├── firmware/                  
+│   ├── esp32_gateway/         
+│   │   ├── config.h
+│   │   ├── data_manager.h
+│   │   ├── esp32_gateway.ino
+│   │   ├── lora_manager.h
+│   │   └── network_manager.h
+│   └── esp32_node/            
+│       ├── command_handler.h
+│       ├── config.h
+│       ├── esp32_node.ino
+│       ├── lora_tx_rx.h
+│       └── mesh.h
+├── server/                   
+│   ├── static/         
+│   │   ├── css/
+│   │   │   └── styles.css
+│   │   └── js/
+│   │       └── app.js
+│   ├── templates/           
+│   │   └── dashboard.html
+│   ├── db_worker.py       
+│   ├── db.sql              
+│   ├── flask_app.py    
+│   └── ingestion_worker.py   
+├── CONTRIBUTING.md       
+└── README.md             
 ```
 
 ---
